@@ -24,7 +24,16 @@ import roomid as core
 
 APP_NAME = "Room ID Overlay"
 PORT = 8080
-OVERLAY_URL = f"http://localhost:{PORT}/"
+LOCAL_URL = f"http://localhost:{PORT}/"
+RELAY = os.environ.get("ROOMID_RELAY", "https://ntfy.sh/")  # free relay: the app posts updates, the overlay page listens
+
+
+def overlay_base():
+    """Address of the overlay page on GitHub Pages; written into the app when it's built."""
+    try:
+        return (core.BASE / "overlay_url.txt").read_text().strip()
+    except Exception:
+        return ""
 SCREEN = "screen"
 SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "RoomIDOverlay"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
@@ -306,6 +315,64 @@ class Scanner:
         return [x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H]
 
 
+# ------------------------------------------------------------------ relay ---
+
+class Relay:
+    """Sends what's on stream to the overlay page (via ntfy.sh), and notices when
+    LIVE Studio has loaded that page."""
+
+    def __init__(self, state, topic):
+        self.state, self.topic = state, topic
+        self.error = None
+        threading.Thread(target=self._publish_loop, daemon=True).start()
+        threading.Thread(target=self._seen_loop, daemon=True).start()
+
+    def _post(self, url, body):
+        import urllib.request
+        req = urllib.request.Request(url, data=body.encode(), method="POST",
+                                     headers={"User-Agent": "RoomIDOverlay"})
+        urllib.request.urlopen(req, timeout=10).read()
+
+    def _publish_loop(self):
+        sent, sent_at = None, 0.0
+        while True:
+            s = self.state.snapshot()
+            payload = {"room_id": s["display_room_id"], "password": s["display_password"],
+                       "visible": bool(s["visible"])}
+            # send when something changes, and hourly so the relay always holds the latest
+            if payload != sent or time.time() - sent_at > 3600:
+                time.sleep(0.3)  # let quick double-changes settle
+                s = self.state.snapshot()
+                payload = {"room_id": s["display_room_id"], "password": s["display_password"],
+                           "visible": bool(s["visible"])}
+                try:
+                    self._post(RELAY + self.topic, json.dumps(payload))
+                    sent, sent_at, self.error = payload, time.time(), None
+                except Exception as e:
+                    self.error = f"Can't reach the internet relay: {e}"
+                    print(self.error)
+                    time.sleep(5)
+                    continue
+            time.sleep(0.3)
+
+    def _seen_loop(self):
+        import urllib.request
+        while True:
+            try:
+                req = urllib.request.Request(RELAY + self.topic + "-seen/json",
+                                             headers={"User-Agent": "RoomIDOverlay"})
+                with urllib.request.urlopen(req, timeout=90) as r:  # ntfy sends keepalives
+                    for line in r:
+                        try:
+                            if json.loads(line).get("event") == "message":
+                                self.state.overlay_seen = time.time()
+                        except ValueError:
+                            pass
+            except Exception as e:
+                print("Seen listener:", e)
+                time.sleep(5)
+
+
 # -------------------------------------------------------------------- app ---
 
 class App:
@@ -324,6 +391,12 @@ class App:
 
         self._start_server()
         self.scanner = Scanner(self.capture, self.state, self.settings)
+        if not self.settings.get("topic"):  # this install's private channel
+            import secrets
+            self._save(topic="roomid-" + secrets.token_hex(10))
+        self.relay = Relay(self.state, self.settings["topic"])
+        base = overlay_base()
+        self.overlay_url = f"{base}?t={self.settings['topic']}" if base else LOCAL_URL
         self._setup_window()
 
         src = self.settings.get("source")
@@ -388,7 +461,8 @@ class App:
             self.capture.set_source(src)
 
     def _overlay_connected(self):
-        return time.time() - self.state.overlay_seen < 3
+        """LIVE Studio has loaded the overlay since this app started (or since the setup page opened)."""
+        return self.state.overlay_seen > 0
 
     # page building helpers --------------------------------------------------
     def _page(self, step=None, title="", text=""):
@@ -663,7 +737,7 @@ class App:
             "Click  Copy link  below.",
             "In LIVE Studio, click  Add source  (bottom left).",
             "Choose  Link.",
-            "Paste the link (Ctrl + V) and click  Add.",
+            "Paste the link (Ctrl + V) and click  Add source.",
             "Drag the box to where you want it on your stream.",
         ]
         for i, s in enumerate(steps, 1):
@@ -673,9 +747,9 @@ class App:
             tk.Label(row, text="  " + s, bg=BG, fg=TEXT, font=(FONT, 12), anchor="w").pack(side="left")
         copy_row = tk.Frame(c, bg=BG)
         copy_row.pack(fill="x", pady=(14, 0))
-        link = tk.Entry(copy_row, font=(FONT, 13), width=24, bg="#0e0f12", fg=TEXT,
+        link = tk.Entry(copy_row, font=(FONT, 10), width=44, bg="#0e0f12", fg=MUTED,
                         readonlybackground="#0e0f12", relief="flat")
-        link.insert(0, OVERLAY_URL)
+        link.insert(0, self.overlay_url)
         link.configure(state="readonly")
         link.pack(side="left", ipady=6)
         copy_btn = ttk.Button(copy_row, text="Copy link", style="Big.TButton")
@@ -683,7 +757,7 @@ class App:
 
         def copy():
             self.root.clipboard_clear()
-            self.root.clipboard_append(OVERLAY_URL)
+            self.root.clipboard_append(self.overlay_url)
             copy_btn.configure(text="Copied!")
             self.root.after(1500, lambda: copy_btn.configure(text="Copy link"))
 
@@ -776,11 +850,11 @@ class App:
                 live.configure(text="Waiting for a room...", fg=MUTED)
             f = self.capture.get()
             game = ("✓  Game picture OK", GOOD) if not is_black(f) else ("✗  No game picture: is PUBG on?", BAD)
-            ttls = ("✓  LIVE Studio connected", GOOD) if self._overlay_connected() else \
-                ("•  LIVE Studio not connected (open LIVE Studio)", MUTED)
+            ttls = ("✓  Sending to your stream", GOOD) if not self.relay.error else \
+                ("✗  Can't reach the internet. Check your connection.", BAD)
             err = f"\n!  {self.scanner.error}" if self.scanner.error else ""
-            checks.configure(text=f"{game[0]}\n{ttls[0]}{err}",
-                             fg=BAD if (err or game[1] == BAD) else (GOOD if ttls[1] == GOOD else MUTED))
+            bad = err or game[1] == BAD or ttls[1] == BAD
+            checks.configure(text=f"{game[0]}\n{ttls[0]}{err}", fg=BAD if bad else GOOD)
         self.page_tick = tick
 
     def _restart_setup(self):
