@@ -67,6 +67,37 @@ def looks_like_capture_card(name):
 
 # ---------------------------------------------------------------- capture ---
 
+def device_worker(conn, index):
+    """Runs in its own process: opens one camera/capture device and hands frames to the app.
+    Some camera drivers crash when opened; in here that only kills this helper, not the app."""
+    setup_crash_log("device")
+    cap = core.open_device(index)
+    if not cap.isOpened():
+        conn.send(("failed", None))
+        return
+    latest = [None]
+
+    def pump():
+        while True:
+            ok, f = cap.read()
+            latest[0] = f if ok else None
+            if not ok:
+                time.sleep(0.1)
+
+    threading.Thread(target=pump, daemon=True).start()
+    conn.send(("ok", None))
+    while True:
+        try:
+            msg = conn.recv()
+        except EOFError:
+            break
+        if msg == "stop":
+            break
+        f = latest[0]
+        conn.send(("frame", None if f is None else (f.shape, f.tobytes())))
+    cap.release()
+
+
 class Capture:
     """Background thread that always holds the newest full frame from the chosen source."""
 
@@ -74,6 +105,7 @@ class Capture:
         self.lock = threading.Lock()
         self.source = None  # device index (int), SCREEN, or None
         self.frame = None
+        self.failed = set()  # devices that crashed or wouldn't open
         threading.Thread(target=self._run, daemon=True).start()
 
     def set_source(self, source):
@@ -86,34 +118,90 @@ class Capture:
             return self.frame
 
     def _run(self):
-        sct = mss.mss()
-        cap, current = None, object()
+        import multiprocessing as mp
+        sct = None
+        proc = conn = None
+        current = object()
         while True:
             src = self.source
             if src != current:
-                if cap is not None:
-                    cap.release()
-                    cap = None
+                if proc is not None:  # close the old device helper
+                    try:
+                        conn.send("stop")
+                    except Exception:
+                        pass
+                    proc.join(1)
+                    if proc.is_alive():
+                        proc.terminate()
+                    proc = conn = None
                 current = src
-                if isinstance(src, int):
-                    cap = core.open_device(src)
+                if isinstance(src, int) and src not in self.failed:
+                    conn, child = mp.Pipe()
+                    proc = mp.Process(target=device_worker, args=(child, src), daemon=True)
+                    proc.start()
+                    child.close()  # so we notice straight away if the helper dies
+                    try:
+                        ok = conn.poll(15) and conn.recv()[0] == "ok"
+                    except (EOFError, OSError):  # helper crashed while opening the device
+                        ok = False
+                    if not ok:
+                        print(f"Device {src} couldn't be opened (exit code {proc.exitcode})")
+                        self.failed.add(src)
+                        proc.terminate()
+                        proc = conn = None
             frame = None
             try:
                 if src == SCREEN:
+                    if sct is None:
+                        sct = mss.mss()
                     frame = np.array(sct.grab(sct.monitors[0]))[:, :, :3]
                     time.sleep(0.25)
-                elif cap is not None and cap.isOpened():
-                    ok, f = cap.read()
-                    frame = f if ok else None
-                    if not ok:
-                        time.sleep(0.1)
+                elif proc is not None:
+                    conn.send("get")
+                    if conn.poll(5):
+                        _, data = conn.recv()
+                        if data is not None:
+                            shape, raw = data
+                            frame = np.frombuffer(raw, np.uint8).reshape(shape)
+                    else:
+                        raise RuntimeError("device stopped answering")
+                    time.sleep(0.15)
                 else:
                     time.sleep(0.2)
             except Exception:
-                time.sleep(0.5)
+                if proc is not None and not proc.is_alive():  # the driver crashed the helper
+                    self.failed.add(src)
+                    proc = conn = None
+                time.sleep(0.3)
             with self.lock:
                 if self.source == src:
                     self.frame = frame
+
+
+# ------------------------------------------------------------- crash log ---
+
+LOG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "RoomIDOverlay"
+
+
+def setup_crash_log(name="app"):
+    """Write crashes and errors to %APPDATA%\\RoomIDOverlay\\<name>-log.txt (windowed apps have no console)."""
+    import faulthandler
+    import sys
+    import traceback
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        f = open(LOG_DIR / f"{name}-log.txt", "w", buffering=1, encoding="utf-8")
+    except Exception:
+        return
+    sys.stdout = sys.stderr = f
+    faulthandler.enable(f, all_threads=True)  # native crashes (driver bugs) still leave a trace
+
+    def log_exc(*args):
+        traceback.print_exception(*args, file=f)
+
+    sys.excepthook = log_exc
+    threading.excepthook = lambda a: traceback.print_exception(a.exc_type, a.exc_value, a.exc_traceback, file=f)
+    print(f"{name} started {time.ctime()}")
 
 
 def is_black(frame):
@@ -401,7 +489,9 @@ class App:
                 yes.state(["!disabled"])
                 status.configure(fg=BAD, text="The picture is black. Is PUBG showing on your phone? "
                                               "If it stays black, click  No, show the next one.")
-            elif waited > 6:
+            elif src in self.capture.failed:
+                status.configure(fg=BAD, text="This one can't be opened. Click  No, show the next one.")
+            elif waited > 8:
                 status.configure(fg=BAD, text="No picture from this one. Click  No, show the next one.")
         self.page_tick = tick
 
@@ -699,7 +789,10 @@ class App:
 
 
 def main():
+    import multiprocessing
     import sys
+    multiprocessing.freeze_support()  # lets the packaged .exe start the device helper process
+    setup_crash_log("app")
     if "--image" in sys.argv:
         i = sys.argv.index("--image")
         if i + 1 >= len(sys.argv):
@@ -713,6 +806,8 @@ def main():
     except Exception:
         pass
     root = tk.Tk()
+    import traceback
+    root.report_callback_exception = lambda *a: traceback.print_exception(*a)  # button errors go to the log
     App(root)
     # background threads (camera, text reader) can't be stopped politely; exit cleanly
     root.protocol("WM_DELETE_WINDOW", lambda: os._exit(0))
