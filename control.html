@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Room Overlay Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; background: #15171c; color: #eee; margin: 0; padding: 24px; }
+  .card { max-width: 420px; margin: auto; background: #1f2229; padding: 20px; border-radius: 12px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .now { background: #111; border-radius: 8px; padding: 12px; margin-bottom: 18px; font-size: 15px; line-height: 1.7; }
+  .now b { color: #f5b400; }
+  label { display: block; font-size: 13px; color: #aaa; margin: 12px 0 4px; }
+  input { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; border-radius: 6px; border: 1px solid #333; background: #111; color: #fff; }
+  .row { display: flex; gap: 8px; margin-top: 16px; }
+  button { flex: 1; padding: 10px; font-size: 15px; border: 0; border-radius: 6px; cursor: pointer; background: #f5b400; color: #111; font-weight: 700; }
+  button.alt { background: #333; color: #eee; }
+  .hint { font-size: 12px; color: #888; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Room Overlay</h1>
+  <div class="now">
+    Detected room ID: <b id="dRid">-</b><br>
+    Detected password: <b id="dPw">-</b><br>
+    On stream: <b id="dShow">-</b>
+  </div>
+  <label for="mRid">Override room ID (leave blank to use detected)</label>
+  <input id="mRid" placeholder="e.g. 12345678">
+  <label for="mPw">Password (overrides detected)</label>
+  <input id="mPw" placeholder="e.g. 1234">
+  <div class="row">
+    <button onclick="save()">Save</button>
+    <button class="alt" onclick="toggle()" id="toggleBtn">Hide</button>
+    <button class="alt" onclick="post({clear:true}).then(()=>{mRid.value='';mPw.value='';})">Clear</button>
+  </div>
+  <p class="hint">A new room ID detected on screen replaces the old one automatically. The password you type here stays until you clear it.</p>
+</div>
+<script>
+  const mRid = document.getElementById("mRid"), mPw = document.getElementById("mPw");
+  let visible = true;
+  async function post(body) {
+    const r = await fetch("/state", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    render(await r.json());
+  }
+  function save() { post({ manual_room_id: mRid.value, manual_password: mPw.value }); }
+  function toggle() { post({ visible: !visible }); }
+  function render(s) {
+    visible = s.visible;
+    document.getElementById("dRid").textContent = s.room_id || "-";
+    document.getElementById("dPw").textContent = s.password || "-";
+    document.getElementById("dShow").textContent =
+      s.visible && s.display_room_id ? `${s.display_room_id}${s.display_password ? " / " + s.display_password : ""}` : "hidden";
+    document.getElementById("toggleBtn").textContent = s.visible ? "Hide" : "Show";
+  }
+  async function poll() { try { render(await (await fetch("/state", { cache: "no-store" })).json()); } catch (e) {} }
+  setInterval(poll, 1000); poll();
+</script>
+</body>
+</html>

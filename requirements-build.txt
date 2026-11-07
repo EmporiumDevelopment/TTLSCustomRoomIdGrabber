@@ -1,0 +1,6 @@
+mss
+numpy
+pillow
+rapidocr_onnxruntime
+pygrabber
+pyinstaller

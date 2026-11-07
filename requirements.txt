@@ -1,0 +1,3 @@
+mss
+numpy
+rapidocr_onnxruntime
