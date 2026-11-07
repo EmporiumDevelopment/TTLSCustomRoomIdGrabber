@@ -7,7 +7,7 @@ python -m pip install -r requirements-build.txt || goto :error
 
 python -m PyInstaller --noconfirm --clean --windowed --name RoomIDOverlay ^
   --add-data "overlay.html;." --add-data "control.html;." --add-data "example_room.png;." --add-data "example_roomid.png;." ^
-  --collect-all rapidocr_onnxruntime --collect-binaries onnxruntime ^
+  --collect-all rapidocr_onnxruntime --collect-binaries onnxruntime --collect-all windows_capture ^
   --hidden-import pygrabber.dshow_graph ^
   app.py || goto :error
 

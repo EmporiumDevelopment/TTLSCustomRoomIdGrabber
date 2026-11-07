@@ -6,6 +6,7 @@ First launch walks through setup one screen at a time:
   password > add to TikTok LIVE Studio (auto-detected) > done
 After that it opens to a small everyday screen.
 """
+import functools
 import json
 import os
 import re
@@ -74,6 +75,207 @@ def looks_like_capture_card(name):
     return any(k in n for k in ("elgato", "game capture", "capture", "hd60", "4k60", "cam link", "neo"))
 
 
+# ---------------------------------------------------------------- windows ---
+# Reading one app window (e.g. a phone mirroring app) instead of the whole screen.
+# The window is captured directly, so it still works when other windows cover it
+# or it gets moved to another monitor.
+
+WINDOW = "window"
+MIRROR_HINTS = ("douwan", "airplay", "mirror", "scrcpy", "lonelyscreen", "reflector", "airserver",
+                "phone link", "vysor", "letsview", "pubg", "game")
+
+
+@functools.lru_cache(maxsize=None)
+def _win32():
+    import ctypes
+    from ctypes import wintypes
+    u, g, k = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.kernel32
+    H = wintypes.HANDLE
+    for fn, res, args in (
+        (u.GetDC, H, [wintypes.HWND]), (u.ReleaseDC, ctypes.c_int, [wintypes.HWND, H]),
+        (u.PrintWindow, wintypes.BOOL, [wintypes.HWND, H, wintypes.UINT]),
+        (u.GetClientRect, wintypes.BOOL, [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]),
+        (u.IsWindow, wintypes.BOOL, [wintypes.HWND]), (u.IsIconic, wintypes.BOOL, [wintypes.HWND]),
+        (u.IsWindowVisible, wintypes.BOOL, [wintypes.HWND]),
+        (u.ClientToScreen, wintypes.BOOL, [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]),
+        (u.GetWindowTextW, ctypes.c_int, [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]),
+        (u.GetWindowThreadProcessId, wintypes.DWORD, [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]),
+        (g.CreateCompatibleDC, H, [H]), (g.CreateCompatibleBitmap, H, [H, ctypes.c_int, ctypes.c_int]),
+        (g.SelectObject, H, [H, H]), (g.DeleteObject, wintypes.BOOL, [H]), (g.DeleteDC, wintypes.BOOL, [H]),
+        (g.GetDIBits, ctypes.c_int, [H, H, wintypes.UINT, wintypes.UINT, ctypes.c_void_p, ctypes.c_void_p,
+                                     wintypes.UINT]),
+        (k.OpenProcess, H, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]),
+        (k.CloseHandle, wintypes.BOOL, [H]),
+        (k.QueryFullProcessImageNameW, wintypes.BOOL, [H, wintypes.DWORD, wintypes.LPWSTR,
+                                                        ctypes.POINTER(wintypes.DWORD)]),
+    ):
+        fn.restype, fn.argtypes = res, args
+    return ctypes, wintypes, u, g, k
+
+
+def _window_exe(hwnd):
+    ctypes, wintypes, u, _, k = _win32()
+    pid = wintypes.DWORD()
+    u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    h = k.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return pid.value, ""
+    try:
+        buf, size = ctypes.create_unicode_buffer(512), wintypes.DWORD(512)
+        k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        return pid.value, Path(buf.value).name.lower()
+    finally:
+        k.CloseHandle(h)
+
+
+def list_windows():
+    """Visible app windows big enough to hold a game picture: [(title, exe), ...]."""
+    try:
+        ctypes, wintypes, u, _, _ = _win32()
+        dwm = ctypes.windll.dwmapi
+    except Exception:
+        return []
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        try:
+            if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd):
+                return True
+            cloaked = wintypes.DWORD()  # hidden Store-app windows report as visible
+            dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)
+            if cloaked.value:
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            u.GetWindowTextW(hwnd, buf, 256)
+            title = buf.value.strip()
+            r = wintypes.RECT()
+            u.GetClientRect(hwnd, ctypes.byref(r))
+            if not title or r.right < 200 or r.bottom < 150:
+                return True
+            pid, exe = _window_exe(hwnd)
+            if pid != os.getpid() and exe not in ("explorer.exe", "textinputhost.exe"):
+                found.append((title, exe))
+        except Exception:
+            pass
+        return True
+
+    u.EnumWindows(each, 0)
+    hint = lambda w: not any(h in (w[0] + " " + w[1]).lower() for h in MIRROR_HINTS)
+    return sorted(found, key=hint)  # mirroring apps first
+
+
+def find_window(title, exe):
+    """The window with this title, or failing that one from the same program."""
+    try:
+        ctypes, wintypes, u, _, _ = _win32()
+    except Exception:
+        return None
+    exact, same_app = [], []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        try:
+            if not u.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            u.GetWindowTextW(hwnd, buf, 256)
+            if buf.value.strip() == title:
+                exact.append(hwnd)
+            elif exe and _window_exe(hwnd)[1] == exe:
+                r = wintypes.RECT()
+                u.GetClientRect(hwnd, ctypes.byref(r))
+                if r.right >= 200 and r.bottom >= 150:
+                    same_app.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    u.EnumWindows(each, 0)
+    return (exact or same_app or [None])[0]
+
+
+class WindowStream:
+    """Live pictures of one window through Windows Graphics Capture (what OBS uses). Works for
+    GPU-drawn apps like DouWan and TikTok LIVE Studio, even when other windows cover them."""
+
+    def __init__(self, hwnd):
+        from windows_capture import WindowsCapture
+        self.latest, self.closed = None, False
+        cap = None
+        for border in (False, None):  # hiding the yellow capture border needs Windows 11
+            try:
+                cap = WindowsCapture(cursor_capture=False, draw_border=border,
+                                     minimum_update_interval=200, window_hwnd=int(hwnd))
+                break
+            except Exception:
+                if border is None:
+                    raise
+
+        @cap.event
+        def on_frame_arrived(frame, control):
+            self.latest = np.array(frame.frame_buffer)[:, :, :3].copy()  # BGRA -> BGR
+
+        @cap.event
+        def on_closed():
+            self.closed = True
+
+        self.control = cap.start_free_threaded()
+
+    def stop(self):
+        try:
+            self.control.stop()
+        except Exception:
+            pass
+
+
+def grab_window(hwnd, sct):
+    """Picture of a window's contents (BGR). Asks the window to draw itself first, which works
+    even when it's covered; apps that draw video on the GPU (like DouWan) refuse that, so then
+    the window's spot on screen is read instead, wherever it has been moved to."""
+    ctypes, wintypes, u, g, _ = _win32()
+    if not u.IsWindow(hwnd) or u.IsIconic(hwnd):
+        return None
+    r = wintypes.RECT()
+    u.GetClientRect(hwnd, ctypes.byref(r))
+    w, h = r.right, r.bottom
+    if w < 20 or h < 20:
+        return None
+    f = _print_window(hwnd, w, h)
+    if f is not None and not is_black(f):
+        return f
+    pt = wintypes.POINT(0, 0)
+    u.ClientToScreen(hwnd, ctypes.byref(pt))
+    return np.array(sct.grab({"left": pt.x, "top": pt.y, "width": w, "height": h}))[:, :, :3]
+
+
+def _print_window(hwnd, w, h):
+    ctypes, wintypes, u, g, _ = _win32()
+
+    class BMI(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("w", wintypes.LONG), ("h", wintypes.LONG),
+                    ("planes", wintypes.WORD), ("bits", wintypes.WORD), ("comp", wintypes.DWORD),
+                    ("img", wintypes.DWORD), ("xppm", wintypes.LONG), ("yppm", wintypes.LONG),
+                    ("used", wintypes.DWORD), ("imp", wintypes.DWORD), ("pad", wintypes.DWORD * 4)]
+
+    hdc = u.GetDC(hwnd)
+    mdc = g.CreateCompatibleDC(hdc)
+    bmp = g.CreateCompatibleBitmap(hdc, w, h)
+    old = g.SelectObject(mdc, bmp)
+    try:
+        if not u.PrintWindow(hwnd, mdc, 3):  # PW_CLIENTONLY | PW_RENDERFULLCONTENT
+            return None
+        bmi = BMI(size=40, w=w, h=-h, planes=1, bits=32)  # negative height = rows top to bottom
+        buf = ctypes.create_string_buffer(w * h * 4)
+        g.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(bmi), 0)
+    finally:
+        g.SelectObject(mdc, old)
+        g.DeleteObject(bmp)
+        g.DeleteDC(mdc)
+        u.ReleaseDC(hwnd, hdc)
+    return np.frombuffer(buf.raw, np.uint8).reshape(h, w, 4)[:, :, :3].copy()
+
+
 # ---------------------------------------------------------------- capture ---
 
 def device_worker(conn, index):
@@ -130,7 +332,14 @@ class Capture:
         import multiprocessing as mp
         sct = None
         proc = conn = None
+        hwnd = stream = None
+        use_wgc = True
         current = object()
+        try:  # this thread sees real pixel sizes on every monitor, whatever their scaling
+            import ctypes
+            ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            pass
         while True:
             src = self.source
             if src != current:
@@ -144,6 +353,10 @@ class Capture:
                         proc.terminate()
                     proc = conn = None
                 current = src
+                hwnd = None
+                if stream:
+                    stream.stop()
+                    stream = None
                 if isinstance(src, int) and src not in self.failed:
                     conn, child = mp.Pipe()
                     proc = mp.Process(target=device_worker, args=(child, src), daemon=True)
@@ -164,6 +377,25 @@ class Capture:
                     if sct is None:
                         sct = mss.mss()
                     frame = np.array(sct.grab(sct.monitors[0]))[:, :, :3]
+                    time.sleep(0.25)
+                elif isinstance(src, tuple) and src[0] == WINDOW:
+                    if hwnd is None or not ctypes.windll.user32.IsWindow(hwnd) or (stream and stream.closed):
+                        if stream:
+                            stream.stop()
+                        stream = None
+                        hwnd = find_window(src[1], src[2])  # app restarted or window reopened
+                        if hwnd and use_wgc:
+                            try:
+                                stream = WindowStream(hwnd)
+                            except Exception as e:  # older Windows: fall back to the simpler ways
+                                print("Window capture unavailable, using screen reading:", e)
+                                use_wgc = False
+                    if stream:
+                        frame = stream.latest
+                    elif hwnd:
+                        if sct is None:
+                            sct = mss.mss()
+                        frame = grab_window(hwnd, sct)
                     time.sleep(0.25)
                 elif proc is not None:
                     conn.send("get")
@@ -256,17 +488,24 @@ class Scanner:
         except Exception as e:
             self.error = f"The text reader didn't start: {e}"
             return
-        last, streak = None, 0
+        last, streak, was_open = None, 0, False
+        lines = []
         while True:
             t0 = time.time()
+            is_open = time.time() - self.state.last_seen < self.state.HIDE_AFTER
+            if is_open != was_open:  # leave a trail in the log for troubleshooting
+                print(f"[{time.strftime('%H:%M:%S')}] Room screen {'found' if is_open else 'gone'}"
+                      f"  (last read: {lines})")
+                was_open = is_open
             try:
                 img = crop(self.capture.get(), self.settings.get("region"))
                 if img is not None:
                     with self.ocr_lock:
                         lines = self.reader.lines(img)
                     rid, _ = core.parse(lines, 6, 10)
-                    if rid and not ROOM_WORD.search(" ".join(lines)):
-                        rid = None  # a number, but not the "Room ID" text: no room screen open
+                    known = rid is not None and rid == self.state.data["room_id"]
+                    if rid and not known and not ROOM_WORD.search(" ".join(lines)):
+                        rid = None  # a new number, but not the "Room ID" text: no room screen open
                     self.last_text = rid
                     if rid:
                         streak = streak + 1 if rid == last else 1
@@ -459,6 +698,9 @@ class App:
         if src == SCREEN:
             self.capture.set_source(SCREEN)
             return
+        if src == WINDOW:
+            self.capture.set_source((WINDOW, name, self.settings.get("source_exe") or ""))
+            return
         for i, n in self.devices:  # match by name: the number can change after a reboot
             if n == name:
                 self.capture.set_source(i)
@@ -536,7 +778,8 @@ class App:
     def page_game_intro(self):
         # try likely capture cards first, then the others, then the whole screen
         devs = sorted(self.devices, key=lambda d: not looks_like_capture_card(d[1]))
-        self.candidates = devs + [(SCREEN, "Your whole screen")]
+        wins = [((WINDOW, title, exe), f"Window: {title}") for title, exe in list_windows()]
+        self.candidates = devs + wins + [(SCREEN, "Your whole screen")]
         self.page_game(0)
 
     def page_game(self, n):
@@ -546,7 +789,9 @@ class App:
         self.capture.set_source(src)
         started = time.time()
         c = self._page(0, "Can you see your game?",
-                       f"Showing: {name}" + (" (use this only if nothing else worked)" if src == SCREEN else ""))
+                       f"Showing: {name}" + (" (use this only if nothing else worked)" if src == SCREEN else
+                              "  (keep this window open; it can be behind others, but not minimised)"
+                              if isinstance(src, tuple) else ""))
         preview = tk.Label(c, bg="#000", width=60, height=16)
         preview.pack(pady=(4, 0))
         status = self._status(c, "Loading the picture...")
@@ -582,7 +827,10 @@ class App:
 
     def _pick_game(self, src, name):
         self.capture.set_source(src)
-        self._save(source=src, source_name=None if src == SCREEN else name)
+        if isinstance(src, tuple):  # a window: remember its title and program
+            self._save(source=WINDOW, source_name=src[1], source_exe=src[2])
+        else:
+            self._save(source=src, source_name=None if src == SCREEN else name, source_exe=None)
         self.page_room()
 
     def page_room(self):
@@ -801,6 +1049,13 @@ class App:
         live.pack(fill="x")
         checks = tk.Label(panel, text="", bg=PANEL, fg=MUTED, font=(FONT, 11), justify="left", anchor="w")
         checks.pack(fill="x", pady=(8, 0))
+        watch_row = tk.Frame(panel, bg=PANEL)  # the part of the game being read, so problems are easy to spot
+        watch_row.pack(fill="x", pady=(10, 0))
+        tk.Label(watch_row, text="Watching:", bg=PANEL, fg=MUTED, font=(FONT, 10)).pack(side="left", anchor="n")
+        watch = tk.Label(watch_row, bg=PANEL)
+        watch.pack(side="left", padx=(8, 0))
+        reading = tk.Label(watch_row, text="", bg=PANEL, fg=MUTED, font=(FONT, 10), anchor="w")
+        reading.pack(side="left", padx=(10, 0))
 
         row = tk.Frame(c, bg=BG)
         row.pack(fill="x", pady=(18, 0))
@@ -858,6 +1113,13 @@ class App:
                 live_label.configure(text="On stream now (shows when a custom room is open)"
                                      if s["visible"] else "On stream now (turned off below)")
             f = self.capture.get()
+            cr = crop(f, self.settings.get("region"))
+            if cr is not None:
+                p = to_photo(cr, 260, 60)
+                self.images[:] = [p]
+                watch.configure(image=p)
+            reading.configure(text=f"Reads: {self.scanner.last_text}" if self.scanner.last_text
+                              else "Reads: no Room ID")
             game = ("✓  Game picture OK", GOOD) if not is_black(f) else ("✗  No game picture: is PUBG on?", BAD)
             ttls = ("✓  Sending to your stream", GOOD) if not self.relay.error else \
                 ("✗  Can't reach the internet. Check your connection.", BAD)
@@ -899,12 +1161,13 @@ def main():
 
 def use_test_image(path):
     """Test mode: pretend a picture is the capture card.  RoomIDOverlay --image shot.png"""
-    global list_devices, SETTINGS_DIR, SETTINGS_FILE
+    global list_devices, list_windows, SETTINGS_DIR, SETTINGS_FILE
     import cv2
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)  # works with any path on Windows
     if img is None:
         raise SystemExit(f"Couldn't open {path}")
     list_devices = lambda: [(0, f"Test picture ({Path(path).name})")]
+    list_windows = lambda: []
     # keep test settings away from the real ones
     SETTINGS_DIR = SETTINGS_DIR / "test"
     SETTINGS_FILE = SETTINGS_DIR / "settings.json"

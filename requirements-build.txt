@@ -4,3 +4,4 @@ pillow
 rapidocr_onnxruntime
 pygrabber
 pyinstaller
+windows-capture
