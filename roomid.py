@@ -205,15 +205,26 @@ class State:
             "visible": True, "updated": 0,
         }
         self.overlay_seen = 0.0  # last time the on-stream overlay asked for data
+        self.last_seen = 0.0     # last time the Room ID was read on screen
+
+    HIDE_AFTER = 5  # seconds without seeing the room screen before the box hides
+
+    def seen(self):
+        """The current Room ID was just read on screen again (room screen still open)."""
+        self.last_seen = time.time()
 
     def snapshot(self):
         with self.lock:
             d = dict(self.data)
         d["display_room_id"] = d["manual_room_id"] or d["room_id"]
         d["display_password"] = d["manual_password"] or d["password"]
+        d["room_open"] = time.time() - self.last_seen < self.HIDE_AFTER
+        # shown only while a custom room screen is open
+        d["on_stream"] = bool(d["visible"] and d["display_room_id"] and d["room_open"])
         return d
 
     def detected(self, room_id, password):
+        self.seen()
         with self.lock:
             changed = False
             if room_id != self.data["room_id"]:
@@ -304,7 +315,7 @@ def scan_loop(cfg, state):
                     reading = (rid, pw)
                     streak = streak + 1 if reading == last else 1
                     last = reading
-                    if streak == cfg["confirm_reads"]:
+                    if streak >= cfg["confirm_reads"]:
                         state.detected(rid, pw)
             except Exception as e:
                 print("Scan error:", e)
