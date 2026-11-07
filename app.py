@@ -83,6 +83,9 @@ def looks_like_capture_card(name):
 WINDOW = "window"
 MIRROR_HINTS = ("douwan", "airplay", "mirror", "scrcpy", "lonelyscreen", "reflector", "airserver",
                 "phone link", "vysor", "letsview", "pubg", "game")
+# Windows' own invisible/helper windows that can never show the game
+SYSTEM_EXES = ("explorer.exe", "textinputhost.exe", "tabtip.exe", "shellexperiencehost.exe",
+               "startmenuexperiencehost.exe", "searchhost.exe", "lockapp.exe", "applicationframehost.exe")
 
 
 @functools.lru_cache(maxsize=None)
@@ -154,7 +157,7 @@ def list_windows():
             if not title or r.right < 200 or r.bottom < 150:
                 return True
             pid, exe = _window_exe(hwnd)
-            if pid != os.getpid() and exe not in ("explorer.exe", "textinputhost.exe"):
+            if pid != os.getpid() and exe not in SYSTEM_EXES:
                 found.append((title, exe))
         except Exception:
             pass
@@ -804,8 +807,7 @@ class App:
         """Auto-pick: TikTok LIVE Studio, else a capture card, else a phone mirroring app, else the first."""
         tests = (lambda s: isinstance(s[0], tuple) and is_live_studio(s[0][1], s[0][2]),
                  lambda s: isinstance(s[0], int) and looks_like_capture_card(s[1].split(": ", 1)[-1]),
-                 lambda s: isinstance(s[0], tuple)
-                 and any(h in (s[0][1] + " " + s[0][2]).lower() for h in MIRROR_HINTS))
+                 lambda s: s[0] != SCREEN and any(h in s[1].lower() for h in MIRROR_HINTS))
         for test in tests:
             for i, s in enumerate(sources):
                 if test(s):
