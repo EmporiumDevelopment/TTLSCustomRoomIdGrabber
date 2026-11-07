@@ -236,6 +236,9 @@ def to_photo(bgr_or_pil, max_w, max_h):
 
 # ---------------------------------------------------------------- scanner ---
 
+ROOM_WORD = re.compile(r"r[o0]{2}m", re.I)  # "Room", allowing for OCR slips
+
+
 class Scanner:
     """Reads the Room ID area twice a second and updates the overlay."""
 
@@ -260,13 +263,16 @@ class Scanner:
                 img = crop(self.capture.get(), self.settings.get("region"))
                 if img is not None:
                     with self.ocr_lock:
-                        rid, _ = core.parse(self.reader.lines(img), 6, 10)
+                        lines = self.reader.lines(img)
+                    rid, _ = core.parse(lines, 6, 10)
+                    if rid and not ROOM_WORD.search(" ".join(lines)):
+                        rid = None  # a number, but not the "Room ID" text: no room screen open
                     self.last_text = rid
                     if rid:
                         streak = streak + 1 if rid == last else 1
                         last = rid
-                        if streak == 2:
-                            self.state.detected(rid, None)
+                        if streak >= 2:  # read the same ID twice in a row
+                            self.state.detected(rid, None)  # also marks the room as open
             except Exception as e:
                 self.error = f"Read error: {e}"
             time.sleep(max(0.0, 0.5 - (time.time() - t0)))
@@ -338,13 +344,13 @@ class Relay:
         while True:
             s = self.state.snapshot()
             payload = {"room_id": s["display_room_id"], "password": s["display_password"],
-                       "visible": bool(s["visible"])}
+                       "visible": s["on_stream"]}
             # send when something changes, and hourly so the relay always holds the latest
             if payload != sent or time.time() - sent_at > 3600:
                 time.sleep(0.3)  # let quick double-changes settle
                 s = self.state.snapshot()
                 payload = {"room_id": s["display_room_id"], "password": s["display_password"],
-                           "visible": bool(s["visible"])}
+                           "visible": s["on_stream"]}
                 try:
                     self._post(RELAY + self.topic, json.dumps(payload))
                     sent, sent_at, self.error = payload, time.time(), None
@@ -789,7 +795,8 @@ class App:
                        "Leave this open while you stream. You can minimise it.")
         panel = tk.Frame(c, bg=PANEL, padx=18, pady=16)
         panel.pack(fill="x")
-        tk.Label(panel, text="On stream now", bg=PANEL, fg=MUTED, font=(FONT, 11)).pack(anchor="w")
+        live_label = tk.Label(panel, text="On stream now", bg=PANEL, fg=MUTED, font=(FONT, 11))
+        live_label.pack(anchor="w")
         live = tk.Label(panel, text="", bg=PANEL, fg=TEXT, font=(FONT, 26, "bold"), anchor="w")
         live.pack(fill="x")
         checks = tk.Label(panel, text="", bg=PANEL, fg=MUTED, font=(FONT, 11), justify="left", anchor="w")
@@ -834,7 +841,7 @@ class App:
             self._save(visible=vis.get())
             self.state.apply({"visible": vis.get()})
 
-        tk.Checkbutton(c, text="Show the box on stream", variable=vis, command=toggle, bg=BG, fg=TEXT,
+        tk.Checkbutton(c, text="Show the box automatically when a room is open", variable=vis, command=toggle, bg=BG, fg=TEXT,
                        selectcolor="#0e0f12", activebackground=BG, activeforeground=TEXT,
                        font=(FONT, 12)).pack(anchor="w", pady=(16, 0))
 
@@ -842,12 +849,14 @@ class App:
 
         def tick():
             s = self.state.snapshot()
-            if s["display_room_id"]:
+            if s["on_stream"]:
                 pwtxt = f"    PW {s['display_password']}" if s["display_password"] else ""
-                live.configure(text=f"ID {s['display_room_id']}{pwtxt}",
-                               fg=TEXT if s["visible"] else MUTED)
+                live.configure(text=f"ID {s['display_room_id']}{pwtxt}", fg=TEXT)
+                live_label.configure(text="On stream now")
             else:
-                live.configure(text="Waiting for a room...", fg=MUTED)
+                live.configure(text="Hidden", fg=MUTED)
+                live_label.configure(text="On stream now (shows when a custom room is open)"
+                                     if s["visible"] else "On stream now (turned off below)")
             f = self.capture.get()
             game = ("✓  Game picture OK", GOOD) if not is_black(f) else ("✗  No game picture: is PUBG on?", BAD)
             ttls = ("✓  Sending to your stream", GOOD) if not self.relay.error else \
