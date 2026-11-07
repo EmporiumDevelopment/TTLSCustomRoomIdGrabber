@@ -165,6 +165,11 @@ def list_windows():
     return sorted(found, key=hint)  # mirroring apps first
 
 
+def is_live_studio(title, exe):
+    t = (title + " " + exe).lower()
+    return "live studio" in t or "livestudio" in t or ("tiktok" in t and "studio" in t)
+
+
 def find_window(title, exe):
     """The window with this title, or failing that one from the same program."""
     try:
@@ -678,6 +683,15 @@ class App:
         style.configure("Big.TButton", font=(FONT, 12, "bold"), padding=(20, 10), background=ACCENT,
                         foreground="#111")
         style.map("Big.TButton", background=[("active", "#ffd040"), ("disabled", "#5a4a10")])
+        style.configure("TCombobox", fieldbackground="#0e0f12", background="#333", foreground=TEXT,
+                        arrowcolor=TEXT, padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", "#0e0f12")], foreground=[("readonly", TEXT)],
+                  selectbackground=[("readonly", "#0e0f12")], selectforeground=[("readonly", TEXT)])
+        r.option_add("*TCombobox*Listbox.background", "#0e0f12")
+        r.option_add("*TCombobox*Listbox.foreground", TEXT)
+        r.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        r.option_add("*TCombobox*Listbox.selectForeground", "#111")
+        r.option_add("*TCombobox*Listbox.font", (FONT, 11))
         self.body = tk.Frame(r, bg=BG)
         self.body.pack(fill="both", expand=True)
 
@@ -775,55 +789,98 @@ class App:
             tk.Label(c, text=line, bg=BG, fg=TEXT, font=(FONT, 12), anchor="w").pack(fill="x", pady=3)
         self._button("Start", self.page_game_intro)
 
-    def page_game_intro(self):
-        # try likely capture cards first, then the others, then the whole screen
+    def _sources(self):
+        """Every source the game could come from, in dropdown order: [(src, label), ...]."""
         devs = sorted(self.devices, key=lambda d: not looks_like_capture_card(d[1]))
-        wins = [((WINDOW, title, exe), f"Window: {title}") for title, exe in list_windows()]
-        self.candidates = devs + wins + [(SCREEN, "Your whole screen")]
-        self.page_game(0)
+        wins = sorted(list_windows(), key=lambda w: not is_live_studio(*w))  # LIVE Studio first
+        out = [((WINDOW, t, e), f"Window: {t}" + ("  (TikTok LIVE Studio)" if is_live_studio(t, e) else ""))
+               for t, e in wins]
+        out += [(i, f"Capture device: {n}") for i, n in devs]
+        out.append((SCREEN, "Whole screen (use only if nothing else works)"))
+        return out
 
-    def page_game(self, n):
-        if n >= len(self.candidates):
-            return self.page_no_game()
-        src, name = self.candidates[n]
-        self.capture.set_source(src)
-        started = time.time()
-        c = self._page(0, "Can you see your game?",
-                       f"Showing: {name}" + (" (use this only if nothing else worked)" if src == SCREEN else
-                              "  (keep this window open; it can be behind others, but not minimised)"
-                              if isinstance(src, tuple) else ""))
-        preview = tk.Label(c, bg="#000", width=60, height=16)
-        preview.pack(pady=(4, 0))
+    @staticmethod
+    def _best_source(sources):
+        """Auto-pick: TikTok LIVE Studio, else a capture card, else a phone mirroring app, else the first."""
+        tests = (lambda s: isinstance(s[0], tuple) and is_live_studio(s[0][1], s[0][2]),
+                 lambda s: isinstance(s[0], int) and looks_like_capture_card(s[1].split(": ", 1)[-1]),
+                 lambda s: isinstance(s[0], tuple)
+                 and any(h in (s[0][1] + " " + s[0][2]).lower() for h in MIRROR_HINTS))
+        for test in tests:
+            for i, s in enumerate(sources):
+                if test(s):
+                    return i
+        return 0
+
+    def page_game_intro(self):
+        self.page_game()
+
+    def page_game(self, keep=None):
+        """Pick the game source from a dropdown. TikTok LIVE Studio is chosen automatically when open.
+        keep: a source to stay on after Refresh (if it still exists)."""
+        sources = self._sources()
+        idx = next((i for i, s in enumerate(sources) if s[0] == keep), None)
+        auto = idx is None
+        if auto:
+            idx = self._best_source(sources)
+        auto_ttls = auto and isinstance(sources[idx][0], tuple) and is_live_studio(*sources[idx][0][1:])
+
+        c = self._page(0, "Where's your game picture?",
+                       "We picked the best match. If it isn't your game, choose another source from the list.")
+        row = tk.Frame(c, bg=BG)
+        row.pack(fill="x")
+        cur = {"src": None, "name": "", "started": 0.0}
+        box = ttk.Combobox(row, state="readonly", font=(FONT, 11), values=[label for _, label in sources])
+        box.pack(side="left", fill="x", expand=True, ipady=3)
+        ttk.Button(row, text="Refresh", command=lambda: self.page_game(cur["src"])).pack(side="left", padx=(8, 0))
+        hint = tk.Label(c, text="", bg=BG, fg=MUTED, font=(FONT, 10), anchor="w", justify="left",
+                        wraplength=WIDTH - 56)
+        hint.pack(fill="x", pady=(4, 0))
+        preview = tk.Label(c, bg="#000", width=60, height=14)
+        preview.pack(pady=(6, 0))
         status = self._status(c, "Loading the picture...")
-        yes = self._button("Yes, that's my game", lambda: self._pick_game(src, name))
-        self._button("No, show the next one", lambda: self.page_game(n + 1), primary=False)
+        yes = self._button("Use this source", lambda: self._pick_game(cur["src"], cur["name"]))
         self._button("Back", self.page_welcome, primary=False, side="left")
-        yes.state(["disabled"])
+
+        def select(i):
+            src, label = sources[i]
+            name = label.split(": ", 1)[1] if isinstance(src, int) else label
+            cur.update(src=src, name=name, started=time.time())
+            self.capture.set_source(src)
+            yes.state(["disabled"])
+            status.configure(fg=MUTED, text="Loading the picture...")
+            if auto_ttls and i == idx:
+                hint.configure(fg=GOOD, text="✓  Found TikTok LIVE Studio and selected it for you. "
+                                             "The Room ID is read from its stream preview.")
+            elif isinstance(src, tuple):
+                hint.configure(fg=MUTED, text="Keep this window open. It can be behind others, "
+                                              "but not minimised.")
+            else:
+                hint.configure(text="")
+
+        box.bind("<<ComboboxSelected>>", lambda _: select(box.current()))
+        box.current(idx)
+        select(idx)
 
         def tick():
             f = self.capture.get()
             if f is not None:
-                p = to_photo(f, WIDTH - 56, 330)
+                p = to_photo(f, WIDTH - 56, 300)
                 self.images[:] = [p]
                 preview.configure(image=p, width=p.width(), height=p.height())
-            waited = time.time() - started
+            waited = time.time() - cur["started"]
             if f is not None and not is_black(f):
                 yes.state(["!disabled"])
-                status.configure(fg=MUTED, text="If this is your PUBG game, click  Yes, that's my game.")
+                status.configure(fg=MUTED, text="If you can see your PUBG game, click  Use this source.")
             elif f is not None and waited > 3:
                 yes.state(["!disabled"])
                 status.configure(fg=BAD, text="The picture is black. Is PUBG showing on your phone? "
-                                              "If it stays black, click  No, show the next one.")
-            elif src in self.capture.failed:
-                status.configure(fg=BAD, text="This one can't be opened. Click  No, show the next one.")
+                                              "If it stays black, pick another source from the list.")
+            elif cur["src"] in self.capture.failed:
+                status.configure(fg=BAD, text="This source can't be opened. Pick another from the list.")
             elif waited > 8:
-                status.configure(fg=BAD, text="No picture from this one. Click  No, show the next one.")
+                status.configure(fg=BAD, text="No picture from this source. Pick another from the list.")
         self.page_tick = tick
-
-    def page_no_game(self):
-        c = self._page(0, "We couldn't find your game",
-                       "Check that the Elgato is plugged in and PUBG is showing on your phone, then try again.")
-        self._button("Try again", self.page_game_intro)
 
     def _pick_game(self, src, name):
         self.capture.set_source(src)
