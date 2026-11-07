@@ -5,7 +5,27 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 jobs:
+  # Publishes site/index.html (the overlay LIVE Studio loads) to GitHub Pages
+  site:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
   build:
     runs-on: windows-latest
     steps:
@@ -18,10 +38,18 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-build.txt
 
+      - name: Write overlay address into the app
+        shell: bash
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "https://${owner}.github.io/${{ github.event.repository.name }}/" > overlay_url.txt
+          cat overlay_url.txt
+
       - name: Build app
         run: >
           python -m PyInstaller --noconfirm --clean --windowed --name RoomIDOverlay
           --add-data "overlay.html;." --add-data "control.html;." --add-data "example_room.png;." --add-data "example_roomid.png;."
+          --add-data "overlay_url.txt;."
           --collect-all rapidocr_onnxruntime --collect-binaries onnxruntime
           --hidden-import pygrabber.dshow_graph
           app.py
