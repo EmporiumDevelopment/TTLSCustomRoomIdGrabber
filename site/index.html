@@ -104,7 +104,12 @@
       + `100% calc(100% - ${r}px), calc(100% - ${r}px) 100%, ${r}px 100%, 0 calc(100% - ${r}px), 0 ${r}px)`;
     bg.style.transform = shape === "slant" ? "skewX(-12deg)" : "none";
     const glow = num(st.glow_size, 0, 100, 0), gc = color(st.glow_color, "#f5b400");
-    wrap.style.filter = glow ? `drop-shadow(0 0 ${glow / 2}px ${gc}) drop-shadow(0 0 ${glow}px ${gc})` : "none";
+    // box-shadow is only drawn outside the box, so a see-through box keeps its colour. Cut corners need drop-shadow.
+    const cut = shape === "cut";
+    bg.style.boxShadow = glow && !cut ? `0 0 ${glow / 2}px ${gc}, 0 0 ${glow}px ${gc}` : "none";
+    wrap.style.filter = glow && cut ? `drop-shadow(0 0 ${glow / 2}px ${gc}) drop-shadow(0 0 ${glow}px ${gc})` : "none";
+    glowRoom = glow ? Math.ceil(glow * 1.5) + 10 : 10;
+    document.body.style.padding = glowRoom + "px";
 
     // labels and numbers
     document.querySelectorAll(".lbl").forEach(el => {
@@ -116,6 +121,16 @@
     document.getElementById("ridLbl").textContent = text(st.id_label, "ID");
     document.getElementById("pwLbl").textContent = text(st.pw_label, "PW");
   }
+
+  // Keeps the box and its glow inside the page; the page edge would cut the glow off in a straight line.
+  let glowRoom = 10;
+  function fit() {
+    box.style.zoom = 1;
+    if (glowRoom <= 10 || !innerWidth || !innerHeight) return;
+    const spare = glowRoom * 2;
+    box.style.zoom = Math.max(.2, Math.min(1, (innerWidth - spare) / box.offsetWidth, (innerHeight - spare) / box.offsetHeight));
+  }
+  addEventListener("resize", fit);
 
   function apply(s) {
     applyStyle(s.style);
@@ -131,6 +146,7 @@
       }
       lastKey = key;
     }
+    fit();
   }
 
   function handle(m) {

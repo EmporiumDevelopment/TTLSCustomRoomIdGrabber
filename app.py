@@ -117,6 +117,35 @@ WEIGHT_NAMES = {300: ["Light", "Semilight"], 400: [""], 500: ["Medium", ""], 600
                 700: ["Bold"], 800: ["ExtraBold", "Extra Bold", "Black", "Bold"], 900: ["Black", "Heavy", "Bold"]}
 
 
+# How each thickness appears in an installed font's name
+FONT_WEIGHTS = {300: ("light",), 400: ("", "regular"), 500: ("medium",), 600: ("semibold", "demibold", "demi"),
+                700: ("bold",), 800: ("extrabold", "extra bold", "ultrabold"), 900: ("black", "heavy")}
+
+
+@functools.lru_cache(maxsize=None)
+def available_weights(family):
+    """The thicknesses this font really has. If it isn't in the font list, all of them, as we can't tell."""
+    from PIL import ImageFont
+    files, name = _font_files(), family.lower()
+    found = [w for w, words in FONT_WEIGHTS.items() if any(f"{name} {word}".strip() in files for word in words)]
+    if found == [400]:  # one file can still hold every thickness (a "variable" font)
+        try:
+            axis = next(a for a in ImageFont.truetype(files[name]).get_variation_axes() if a["name"] == b"Weight")
+            found = [w for w in FONT_WEIGHTS if axis["minimum"] <= w <= axis["maximum"]]
+        except Exception:  # an ordinary font: Regular really is all it has
+            pass
+    return found or list(FONT_WEIGHTS)
+
+
+def closest_weight(weight, available):
+    """The same choice browsers make for a missing thickness, so switching to it never changes the look."""
+    if weight in available:
+        return weight
+    heavier = sorted(w for w in available if w > weight)
+    lighter = sorted((w for w in available if w < weight), reverse=True)
+    return (heavier + lighter if weight > 500 else lighter + heavier)[0]
+
+
 @functools.lru_cache(maxsize=256)
 def load_font(family, px, weight=400, italic=False):
     from PIL import ImageFont
@@ -175,7 +204,7 @@ def animations_enabled():
 
 def render_box(st, room_id="12345678", password="1234"):
     """The overlay box as a transparent PIL image at its real on-stream size."""
-    from PIL import ImageDraw, ImageFilter
+    from PIL import ImageChops, ImageDraw, ImageFilter
     st = {**DEFAULT_STYLE, **st}
     s = st["size"]
     f = load_font(st["font"], s, st["weight"], st["italic"])
@@ -239,8 +268,12 @@ def render_box(st, room_id="12345678", password="1234"):
     if st["glow_size"]:
         glow = Image.new("RGBA", (W, H), _rgb(st["glow_color"]) + (0,))
         glow.putalpha(layer.getchannel("A"))
+        solid = mask.transform((W, H), Image.AFFINE, (1, k, -k * H / 2, 0, 1, 0), Image.BICUBIC) if slant else mask
         for radius in (st["glow_size"] / 4, st["glow_size"] / 2):
-            out = Image.alpha_composite(out, glow.filter(ImageFilter.GaussianBlur(radius)))
+            halo = glow.filter(ImageFilter.GaussianBlur(radius))
+            if st["shape"] != "cut":  # like the overlay: glow only outside the box, so see-through boxes keep their colour
+                halo.putalpha(ImageChops.subtract(halo.getchannel("A"), solid))
+            out = Image.alpha_composite(out, halo)
     out = Image.alpha_composite(out, layer)
 
     # the text, lined up on a shared baseline like the overlay's grid
@@ -1747,7 +1780,7 @@ class App:
         ("Text", [
             ("font", "Font", "font", None),
             ("size", "Text size", "slider", (16, 240)),
-            ("weight", "Thickness", "choice", {300: "Light", 400: "Regular", 500: "Medium", 600: "Semibold",
+            ("weight", "Thickness", "weight", {300: "Light", 400: "Regular", 500: "Medium", 600: "Semibold",
                                                700: "Bold", 800: "Extra bold", 900: "Black"}),
             ("italic", "Italic", "check", None),
             ("text_color", "Number colour", "color", None),
@@ -1848,7 +1881,13 @@ class App:
             self.images[:] = [photo]
             preview.configure(image=photo, width=pw_, height=ph_)
 
+        font_shown = st["font"]
+
         def changed():
+            nonlocal font_shown
+            if st["font"] != font_shown:  # a different font has different thicknesses to offer
+                font_shown = st["font"]
+                setters["weight"]()
             if not jobs.get("draw"):  # keeps redrawing during a drag, as often as the drawing can keep up
                 jobs["draw"] = self.root.after(16, draw)
             self.state.apply({"style": dict(st)})
@@ -1887,6 +1926,20 @@ class App:
             st[key] = v
             changed()
 
+        if kind == "weight":
+            box = ttk.Combobox(parent, state="readonly", font=(FONT, 10), height=15, width=24)
+            box.grid(row=r, column=1, sticky="w", pady=3)
+            weights = []
+
+            def show_weights(_=None):
+                weights[:] = available_weights(st["font"])
+                st["weight"] = closest_weight(st["weight"], weights)
+                box.configure(values=[opt[w] for w in weights])
+                box.set(opt[st["weight"]])
+
+            show_weights()
+            box.bind("<<ComboboxSelected>>", lambda _: store(weights[box.current()]))
+            return show_weights
         if kind in ("font", "choice"):
             labels = fonts if kind == "font" else list(opt.values())
             values = fonts if kind == "font" else list(opt.keys())
