@@ -203,6 +203,8 @@ class State:
             "room_id": None, "password": None,   # detected
             "manual_room_id": None, "manual_password": None,  # typed in control panel
             "visible": True, "updated": 0,
+            "style": {},        # how the box looks on stream (empty = the default look)
+            "preview": False,   # show a sample box on stream while the look is being customised
         }
         self.overlay_seen = 0.0  # last time the on-stream overlay asked for data
         self.last_seen = 0.0     # last time the Room ID was read on screen
@@ -221,6 +223,10 @@ class State:
         d["room_open"] = time.time() - self.last_seen < self.HIDE_AFTER
         # shown only while a custom room screen is open
         d["on_stream"] = bool(d["visible"] and d["display_room_id"] and d["room_open"])
+        if d["preview"]:  # customising the look: always show a box, with sample numbers if needed
+            d["display_room_id"] = d["display_room_id"] or "12345678"
+            d["display_password"] = d["display_password"] or "1234"
+            d["on_stream"] = True
         return d
 
     def detected(self, room_id, password):
@@ -249,6 +255,10 @@ class State:
                     self.data[k] = (str(body[k]).strip() or None) if body[k] is not None else None
             if "visible" in body:
                 self.data["visible"] = bool(body["visible"])
+            if isinstance(body.get("style"), dict):
+                self.data["style"] = dict(body["style"])
+            if "preview" in body:
+                self.data["preview"] = bool(body["preview"])
             self.data["updated"] = time.time()
 
 

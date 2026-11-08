@@ -45,6 +45,189 @@ FONT = "Segoe UI"
 WIDTH = 640
 STEPS = ["Game", "Room", "Room ID", "Password", "LIVE Studio"]
 
+# How the Room ID box looks on stream. These defaults are the original look; "Customise box" changes them.
+# Sizes marked % are a percentage of the text size, so the box keeps its shape when the text is resized.
+DEFAULT_STYLE = {
+    # text
+    "font": "Segoe UI", "size": 64, "weight": 800, "italic": False, "text_color": "#ffffff",
+    "letter_spacing": 2, "align": "right",
+    # labels
+    "show_labels": True, "id_label": "ID", "pw_label": "PW", "label_color": "#ffffff", "label_size": 100,
+    # box fill and border
+    "box_color": "#141418", "box_opacity": 82, "gradient": False, "box_color2": "#6a3093",
+    "gradient_angle": 135, "border_width": 0, "border_color": "#ffffff",
+    # shape and spacing
+    "shape": "rounded", "radius": 10, "layout": "stacked", "line_height": 115,
+    "pad_x": 60, "pad_y": 25, "col_gap": 160, "row_gap": 5,
+    # text effects
+    "shadow": True, "shadow_color": "#000000", "shadow_opacity": 50, "shadow_blur": 6, "shadow_y": 2,
+    "outline_width": 0, "outline_color": "#000000",
+    # box effects
+    "glow_size": 0, "glow_color": "#f5b400", "anim": "zoom", "flash": True, "flash_color": "#ffffff",
+}
+
+
+# ------------------------------------------------------------- box preview ---
+# Draws the box the way the overlay page does, so the app can show a preview.
+
+@functools.lru_cache(maxsize=None)
+def _font_files():
+    """Installed fonts: {"segoe ui bold": "C:/Windows/Fonts/segoeuib.ttf", ...}"""
+    out = {}
+    try:
+        import winreg
+    except ImportError:
+        return out
+    key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            k = winreg.OpenKey(hive, key)
+        except OSError:
+            continue
+        i = 0
+        while True:
+            try:
+                name, file, _ = winreg.EnumValue(k, i)
+            except OSError:
+                break
+            i += 1
+            name = re.sub(r"\s*\(.*\)\s*$", "", name)  # drop "(TrueType)"
+            path = file if os.path.isabs(file) else os.path.join(
+                os.environ.get("WINDIR", "C:/Windows"), "Fonts", file)
+            for n in name.split("&"):
+                out.setdefault(n.strip().lower(), path)
+    return out
+
+
+WEIGHT_NAMES = {300: ["Light", "Semilight"], 400: [""], 500: ["Medium", ""], 600: ["Semibold", "SemiBold", "Bold"],
+                700: ["Bold"], 800: ["ExtraBold", "Extra Bold", "Black", "Bold"], 900: ["Black", "Heavy", "Bold"]}
+
+
+@functools.lru_cache(maxsize=256)
+def load_font(family, px, weight=400, italic=False):
+    from PIL import ImageFont
+    files = _font_files()
+    for fam in (family, "Segoe UI"):
+        for w in WEIGHT_NAMES.get(weight, [""]) + [""]:
+            for it in (["Italic", "Oblique", ""] if italic else [""]):
+                path = files.get(" ".join(x for x in (fam, w, it) if x).lower())
+                if path:
+                    try:
+                        return ImageFont.truetype(path, px)
+                    except OSError:
+                        pass
+    return ImageFont.load_default(px)
+
+
+def _rgb(hex_color):
+    return tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def render_box(st, room_id="12345678", password="1234"):
+    """The overlay box as a transparent PIL image at its real on-stream size."""
+    from PIL import ImageDraw, ImageFilter
+    st = {**DEFAULT_STYLE, **st}
+    s = st["size"]
+    f = load_font(st["font"], s, st["weight"], st["italic"])
+    lf = load_font(st["font"], max(6, round(s * st["label_size"] / 100)), st["weight"], st["italic"])
+    ls = s * st["letter_spacing"] / 100
+
+    def tlen(font, t):
+        return font.getlength(t) + ls * len(t)
+
+    pairs = [(st["id_label"], room_id), (st["pw_label"], password)]
+    rows = [pairs[0] + pairs[1]] if st["layout"] == "row" else [pairs[0], pairs[1]]
+    rows = [[(t, i % 2 == 0) for i, t in enumerate(r) if st["show_labels"] or i % 2] for r in rows]
+    ncol = len(rows[0])
+    widths = [max(tlen(lf if r[i][1] else f, r[i][0]) for r in rows) for i in range(ncol)]
+    line, gap_c, gap_r = s * st["line_height"] / 100, s * st["col_gap"] / 100, s * st["row_gap"] / 100
+    pad_x, pad_y = s * st["pad_x"] / 100, s * st["pad_y"] / 100
+    w = sum(widths) + gap_c * (ncol - 1) + 2 * pad_x
+    h = line * len(rows) + gap_r * (len(rows) - 1) + 2 * pad_y
+    slant = st["shape"] == "slant"
+    m = int(max(st["glow_size"] * 2, st["shadow_blur"] * 2 + abs(st["shadow_y"]), 4)
+            + (h * 0.22 if slant else 0) + 8)
+    W, H = int(w + 2 * m), int(h + 2 * m)
+    x0, y0, x1, y1 = m, m, m + w, m + h
+
+    def outline(draw, inset=0.0, **kw):
+        """Draw the box's shape (inset pulls it inwards, for the border)."""
+        a, b, c, d = x0 + inset, y0 + inset, x1 - inset, y1 - inset
+        shape, r = st["shape"], st["radius"]
+        if shape == "cut":
+            k = max(0, min(r, w / 2, h / 2) - inset * 0.4)
+            draw.polygon([(a + k, b), (c - k, b), (c, b + k), (c, d - k), (c - k, d), (a + k, d), (a, d - k),
+                          (a, b + k)], **kw)
+        else:
+            rad = ((d - b) / 2 if shape == "pill" else 0 if shape == "square"
+                   else max(0, min(r, w / 2, h / 2) - inset))
+            draw.rounded_rectangle([a, b, c, d], rad, **kw)
+
+    # box fill (solid or gradient) at the chosen opacity
+    mask = Image.new("L", (W, H), 0)
+    outline(ImageDraw.Draw(mask), fill=255)
+    if st["gradient"]:  # same direction rules as CSS linear-gradient
+        ang = np.radians(st["gradient_angle"])
+        dx, dy = np.sin(ang), -np.cos(ang)
+        length = abs(w * dx) + abs(h * dy) or 1
+        ys, xs = np.mgrid[0:H, 0:W]
+        t = np.clip(((xs - W / 2) * dx + (ys - H / 2) * dy) / length + 0.5, 0, 1)[..., None]
+        rgb = np.array(_rgb(st["box_color"])) * (1 - t) + np.array(_rgb(st["box_color2"])) * t
+    else:
+        rgb = np.broadcast_to(np.array(_rgb(st["box_color"]), float), (H, W, 3))
+    a_chan = (np.asarray(mask, float) * st["box_opacity"] / 100)[..., None]
+    layer = Image.fromarray(np.concatenate([rgb, a_chan], axis=2).astype(np.uint8), "RGBA")
+    bw = st["border_width"]
+    if bw:
+        border = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        outline(ImageDraw.Draw(border), inset=bw / 2, outline=_rgb(st["border_color"]) + (255,), width=int(bw))
+        layer = Image.alpha_composite(layer, border)
+    if slant:  # CSS skewX(-12deg) around the middle
+        k = float(np.tan(np.radians(12)))
+        layer = layer.transform((W, H), Image.AFFINE, (1, k, -k * H / 2, 0, 1, 0), Image.BICUBIC)
+    out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if st["glow_size"]:
+        glow = Image.new("RGBA", (W, H), _rgb(st["glow_color"]) + (0,))
+        glow.putalpha(layer.getchannel("A"))
+        for radius in (st["glow_size"] / 4, st["glow_size"] / 2):
+            out = Image.alpha_composite(out, glow.filter(ImageFilter.GaussianBlur(radius)))
+    out = Image.alpha_composite(out, layer)
+
+    # the text, lined up on a shared baseline like the overlay's grid
+    asc, desc = f.getmetrics()
+    stroke = round(st["outline_width"] / 2)
+
+    def draw_text(draw, dy, fill, stroke_fill):
+        for ri, r in enumerate(rows):
+            base = y0 + pad_y + ri * (line + gap_r) + line / 2 + (asc - desc) / 2 + dy
+            x = x0 + pad_x
+            for i, (t, lab) in enumerate(r):
+                font = lf if lab else f
+                tw = tlen(font, t)
+                if lab or st["align"] == "left":
+                    tx = x
+                elif st["align"] == "center":
+                    tx = x + (widths[i] - tw) / 2
+                else:
+                    tx = x + widths[i] - tw
+                color = fill or _rgb(st["label_color"] if lab else st["text_color"]) + (255,)
+                for ch in t:
+                    draw.text((tx, base), ch, font=font, fill=color, anchor="ls",
+                              stroke_width=stroke, stroke_fill=stroke_fill)
+                    tx += font.getlength(ch) + ls
+                x += widths[i] + gap_c
+
+    if st["shadow"]:
+        sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sc = _rgb(st["shadow_color"]) + (round(255 * st["shadow_opacity"] / 100),)
+        draw_text(ImageDraw.Draw(sh), st["shadow_y"], sc, sc)
+        if st["shadow_blur"]:
+            sh = sh.filter(ImageFilter.GaussianBlur(st["shadow_blur"] / 2))
+        out = Image.alpha_composite(out, sh)
+    txt = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw_text(ImageDraw.Draw(txt), 0, None, _rgb(st["outline_color"]) + (255,))
+    return Image.alpha_composite(out, txt)
+
 
 # --------------------------------------------------------------- settings ---
 
@@ -586,18 +769,24 @@ class Relay:
                                      headers={"User-Agent": "RoomIDOverlay"})
         urllib.request.urlopen(req, timeout=10).read()
 
+    def _payload(self):
+        s = self.state.snapshot()
+        return {"room_id": s["display_room_id"], "password": s["display_password"],
+                "visible": s["on_stream"], "style": s["style"]}
+
     def _publish_loop(self):
         sent, sent_at = None, 0.0
         while True:
-            s = self.state.snapshot()
-            payload = {"room_id": s["display_room_id"], "password": s["display_password"],
-                       "visible": s["on_stream"]}
+            payload = self._payload()
             # send when something changes, and hourly so the relay always holds the latest
             if payload != sent or time.time() - sent_at > 3600:
-                time.sleep(0.3)  # let quick double-changes settle
-                s = self.state.snapshot()
-                payload = {"room_id": s["display_room_id"], "password": s["display_password"],
-                           "visible": s["on_stream"]}
+                # let changes settle (e.g. a slider being dragged) so the relay isn't flooded
+                for _ in range(10):
+                    time.sleep(0.3)
+                    now = self._payload()
+                    if now == payload:
+                        break
+                    payload = now
                 try:
                     self._post(RELAY + self.topic, json.dumps(payload))
                     sent, sent_at, self.error = payload, time.time(), None
@@ -640,7 +829,8 @@ class App:
 
         if self.settings.get("password"):
             self.state.apply({"manual_password": self.settings["password"]})
-        self.state.apply({"visible": self.settings.get("visible", True)})
+        self.state.apply({"visible": self.settings.get("visible", True),
+                          "style": {**DEFAULT_STYLE, **self.settings.get("style", {})}})
 
         self._start_server()
         self.scanner = Scanner(self.capture, self.state, self.settings)
@@ -695,6 +885,10 @@ class App:
         r.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         r.option_add("*TCombobox*Listbox.selectForeground", "#111")
         r.option_add("*TCombobox*Listbox.font", (FONT, 11))
+        style.configure("Style.TNotebook", background=BG, borderwidth=0, tabmargins=0)
+        style.configure("Style.TNotebook.Tab", background="#2a2d35", foreground=MUTED, padding=(9, 5),
+                        font=(FONT, 10), borderwidth=0)
+        style.map("Style.TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", TEXT)])
         self.body = tk.Frame(r, bg=BG)
         self.body.pack(fill="both", expand=True)
 
@@ -734,6 +928,8 @@ class App:
         """Clear the window and start a new page. Returns the content frame."""
         self.page_tick = None
         self.images = []
+        if self.state.data.get("preview"):  # leaving "Customise box": stop the sample on stream
+            self.state.apply({"preview": False})
         for w in self.body.winfo_children():
             w.destroy()
         if step is not None:
@@ -1160,6 +1356,7 @@ class App:
                        font=(FONT, 12)).pack(anchor="w", pady=(16, 0))
 
         self._button("Run setup again", self._restart_setup, primary=False, side="left")
+        self._button("Customise box", self.page_style, primary=False)
 
         def tick():
             s = self.state.snapshot()
@@ -1186,6 +1383,198 @@ class App:
             bad = err or game[1] == BAD or ttls[1] == BAD
             checks.configure(text=f"{game[0]}\n{ttls[0]}{err}", fg=BAD if bad else GOOD)
         self.page_tick = tick
+
+    # ------------------------------------------------------- box style ---
+    # Every setting on the "Customise box" page: tab -> [(setting, label, kind, options)]
+    STYLE_TABS = [
+        ("Text", [
+            ("font", "Font", "font", None),
+            ("size", "Text size", "slider", (16, 240)),
+            ("weight", "Thickness", "choice", {300: "Light", 400: "Regular", 500: "Medium", 600: "Semibold",
+                                               700: "Bold", 800: "Extra bold", 900: "Black"}),
+            ("italic", "Italic", "check", None),
+            ("text_color", "Number colour", "color", None),
+            ("letter_spacing", "Letter spacing", "slider", (-10, 60)),
+            ("align", "Number alignment", "choice", {"right": "Right", "center": "Centre", "left": "Left"}),
+        ]),
+        ("Labels", [
+            ("show_labels", "Show labels", "check", None),
+            ("id_label", "Room ID label", "text", None),
+            ("pw_label", "Password label", "text", None),
+            ("label_color", "Label colour", "color", None),
+            ("label_size", "Label size (%)", "slider", (20, 200)),
+        ]),
+        ("Box", [
+            ("box_color", "Box colour", "color", None),
+            ("box_opacity", "Box opacity (%)", "slider", (0, 100)),
+            ("gradient", "Gradient fill", "check", None),
+            ("box_color2", "Gradient 2nd colour", "color", None),
+            ("gradient_angle", "Gradient angle", "slider", (0, 360)),
+            ("border_width", "Border thickness", "slider", (0, 30)),
+            ("border_color", "Border colour", "color", None),
+        ]),
+        ("Shape", [
+            ("shape", "Shape", "choice", {"rounded": "Rounded", "pill": "Pill", "square": "Square",
+                                          "cut": "Cut corners", "slant": "Slanted"}),
+            ("radius", "Corner size", "slider", (0, 120)),
+            ("layout", "Layout", "choice", {"stacked": "ID above PW", "row": "All on one line"}),
+        ]),
+        ("Spacing", [
+            ("pad_x", "Side padding", "slider", (0, 300)),
+            ("pad_y", "Top / bottom padding", "slider", (0, 200)),
+            ("col_gap", "Gap: label to number", "slider", (0, 400)),
+            ("row_gap", "Gap between rows", "slider", (0, 150)),
+            ("line_height", "Line height", "slider", (60, 250)),
+        ]),
+        ("Text effects", [
+            ("shadow", "Text shadow", "check", None),
+            ("shadow_color", "Shadow colour", "color", None),
+            ("shadow_opacity", "Shadow strength (%)", "slider", (0, 100)),
+            ("shadow_blur", "Shadow blur", "slider", (0, 60)),
+            ("shadow_y", "Shadow drop", "slider", (-30, 30)),
+            ("outline_width", "Text outline", "slider", (0, 20)),
+            ("outline_color", "Outline colour", "color", None),
+        ]),
+        ("Box effects", [
+            ("glow_size", "Glow size", "slider", (0, 80)),
+            ("glow_color", "Glow colour", "color", None),
+            ("anim", "Appear animation", "choice", {"zoom": "Zoom", "fade": "Fade", "slide": "Slide down",
+                                                    "pop": "Pop", "none": "None"}),
+            ("flash", "Flash on new room", "check", None),
+            ("flash_color", "Flash colour", "color", None),
+        ]),
+    ]
+
+    def page_style(self):
+        """Change how the Room ID box looks on stream, with a live preview."""
+        from tkinter import colorchooser
+        from tkinter import font as tkfont
+
+        c = self._page(None, "Customise your Room ID box",
+                       "Changes go on stream straight away, with a sample box shown while this page is open.")
+        self.state.apply({"preview": True})
+        st = {**DEFAULT_STYLE, **self.settings.get("style", {})}
+        pw_, ph_ = WIDTH - 56, 170
+        preview = tk.Label(c, bg="#000", width=pw_, height=ph_)
+        preview.pack()
+        yy, xx = np.indices((ph_, pw_))
+        checker = np.empty((ph_, pw_, 4), np.uint8)  # "stream" behind the box, so see-through parts show
+        checker[:] = (58, 63, 75, 255)
+        checker[(yy // 14 + xx // 14) % 2 == 1, :3] = (66, 71, 84)
+        jobs = {}
+
+        def later(name, ms, fn):  # run fn once things stop changing for a moment
+            if jobs.get(name):
+                self.root.after_cancel(jobs[name])
+            jobs[name] = self.root.after(ms, fn)
+
+        def draw():
+            k = min(1.0, 90 / st["size"])  # big text: draw a scaled-down copy so sliders stay smooth
+            small = {**st, **{key: st[key] * k for key in ("size", "radius", "border_width", "glow_size",
+                                                           "shadow_blur", "shadow_y", "outline_width")}}
+            small["size"] = max(6, round(small["size"]))
+            try:
+                img = render_box(small)
+            except Exception as e:  # a bad font file etc. must never break the page
+                print("Preview failed:", e)
+                return
+            bg = Image.fromarray(checker, "RGBA")
+            scale = min(1.0, (pw_ - 10) / img.width, (ph_ - 10) / img.height)
+            if scale < 1:
+                img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
+            bg.alpha_composite(img, ((pw_ - img.width) // 2, (ph_ - img.height) // 2))
+            photo = ImageTk.PhotoImage(bg)
+            self.images[:] = [photo]
+            preview.configure(image=photo, width=pw_, height=ph_)
+
+        def changed():
+            later("draw", 40, draw)
+            self.state.apply({"style": dict(st)})
+            later("save", 400, lambda: self._save(style=dict(st)))
+
+        nb = ttk.Notebook(c, style="Style.TNotebook")
+        nb.pack(fill="both", expand=True, pady=(10, 0))
+        setters = {}  # setting -> function that puts a value back into its control (for Reset)
+        fonts = sorted({f for f in tkfont.families(self.root) if not f.startswith("@")}, key=str.lower)
+
+        for tab, rows in self.STYLE_TABS:
+            frame = tk.Frame(nb, bg=PANEL, padx=14, pady=8)
+            frame.columnconfigure(1, weight=1)
+            nb.add(frame, text=tab)
+            for r, (key, text, kind, opt) in enumerate(rows):
+                tk.Label(frame, text=text, bg=PANEL, fg=TEXT, font=(FONT, 11), anchor="w").grid(
+                    row=r, column=0, sticky="w", padx=(0, 14), pady=3)
+                setters[key] = self._style_control(frame, r, key, kind, opt, st, changed, fonts, colorchooser)
+
+        def reset():
+            if not messagebox.askyesno(APP_NAME, "Put the box back to how it looked originally?", parent=self.root):
+                return
+            st.clear()
+            st.update(DEFAULT_STYLE)
+            for key, put in setters.items():
+                put(st[key])
+            changed()
+
+        self._button("Done", self.page_dashboard)
+        self._button("Reset to default", reset, primary=False, side="left")
+        draw()
+
+    def _style_control(self, parent, r, key, kind, opt, st, changed, fonts, colorchooser):
+        """One control on the "Customise box" page. Returns a function that sets its value."""
+        def store(v):
+            st[key] = v
+            changed()
+
+        if kind in ("font", "choice"):
+            labels = fonts if kind == "font" else list(opt.values())
+            values = fonts if kind == "font" else list(opt.keys())
+            box = ttk.Combobox(parent, values=labels, state="readonly", font=(FONT, 10), height=15, width=24)
+            box.grid(row=r, column=1, sticky="w", pady=3)
+
+            def put(v):
+                box.set(v if kind == "font" else opt.get(v, ""))
+            put(st[key])
+            box.bind("<<ComboboxSelected>>", lambda _: store(values[box.current()]))
+            return put
+        if kind == "check":
+            var = tk.BooleanVar(value=st[key])
+            tk.Checkbutton(parent, variable=var, command=lambda: store(var.get()), bg=PANEL, fg=TEXT,
+                           selectcolor="#0e0f12", activebackground=PANEL, activeforeground=TEXT).grid(
+                row=r, column=1, sticky="w", pady=3)
+            return var.set
+        if kind == "slider":
+            var = tk.IntVar(value=st[key])
+            tk.Scale(parent, from_=opt[0], to=opt[1], orient="horizontal", variable=var,
+                     command=lambda _: store(var.get()), bg=PANEL, fg=TEXT, troughcolor="#0e0f12",
+                     highlightthickness=0, activebackground=ACCENT, sliderrelief="flat", bd=0,
+                     font=(FONT, 9), length=300, width=12).grid(row=r, column=1, sticky="w")
+            return var.set
+        if kind == "color":
+            row = tk.Frame(parent, bg=PANEL)
+            row.grid(row=r, column=1, sticky="w", pady=3)
+            sw = tk.Button(row, width=4, relief="flat", cursor="hand2", bd=0)
+            sw.pack(side="left", ipady=1)
+            hexlbl = tk.Label(row, bg=PANEL, fg=MUTED, font=(FONT, 10))
+            hexlbl.pack(side="left", padx=8)
+
+            def put(v):
+                sw.configure(bg=v, activebackground=v)
+                hexlbl.configure(text=v.upper())
+
+            def pick():
+                got = colorchooser.askcolor(st[key], parent=self.root, title="Pick a colour")[1]
+                if got:
+                    put(got.lower())
+                    store(got.lower())
+            sw.configure(command=pick)
+            put(st[key])
+            return put
+        # text
+        var = tk.StringVar(value=st[key])
+        tk.Entry(parent, textvariable=var, font=(FONT, 11), width=10, bg="#0e0f12", fg=TEXT,
+                 insertbackground=TEXT, relief="flat").grid(row=r, column=1, sticky="w", pady=3, ipady=3)
+        var.trace_add("write", lambda *_: store(var.get()[:20]))
+        return var.set
 
     def _restart_setup(self):
         self._save(setup_done=False)

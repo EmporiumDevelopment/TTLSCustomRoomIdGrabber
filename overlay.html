@@ -7,41 +7,120 @@
   html, body { margin: 0; background: transparent; overflow: hidden; }
   body { font-family: "Segoe UI", Arial, sans-serif; padding: 10px; }
   #box {
+    position: relative; isolation: isolate;
     display: inline-grid; grid-template-columns: auto auto; column-gap: 1.6em; row-gap: .05em;
-    padding: .25em .6em; border-radius: 10px;
-    background: rgba(20, 20, 24, 0.82);
+    align-items: baseline; padding: .25em .6em;
     color: #fff; font-size: 64px; font-weight: 800; line-height: 1.15;
     font-variant-numeric: tabular-nums; letter-spacing: .02em;
-    text-shadow: 0 2px 6px rgba(0,0,0,.5);
+    text-shadow: 0 2px 6px rgba(0,0,0,.5); paint-order: stroke fill;
     opacity: 0; transform: scale(.96);
     transition: opacity .35s ease, transform .35s ease;
   }
+  /* how the box appears: zoom (default), fade, slide, pop or none */
+  #box[data-anim="fade"] { transform: none; }
+  #box[data-anim="slide"] { transform: translateY(-40px); }
+  #box[data-anim="pop"] { transform: scale(.5); transition: opacity .25s ease, transform .45s cubic-bezier(.34,1.56,.64,1); }
+  #box[data-anim="none"] { transform: none; transition: none; }
   #box.show { opacity: 1; transform: none; }
-  #box.flash { animation: flash 1.2s ease; }
-  @keyframes flash { 30% { box-shadow: 0 0 0 4px #fff, 0 0 30px rgba(255,255,255,.6); } }
-  .pw.hidden { display: none; }
+  /* the box's shape, fill, border and glow sit on their own layer behind the text */
+  #bgwrap, #bg { position: absolute; inset: 0; }
+  #bgwrap { z-index: -1; }
+  #bg { box-sizing: border-box; border-radius: 10px; background: rgba(20, 20, 24, 0.82); }
+  #box.flash #bgwrap { animation: flash 1.2s ease; }
+  @keyframes flash { 30% { filter: drop-shadow(0 0 3px var(--flash, #fff)) drop-shadow(0 0 20px var(--flash, #fff)); } }
+  .pw.hidden { display: none !important; }
   .val { text-align: right; }
 </style>
 </head>
 <body>
 <div id="box">
-  <span>ID</span><span class="val" id="rid">-</span>
-  <span class="pw">PW</span><span class="val pw" id="pw">-</span>
+  <div id="bgwrap"><div id="bg"></div></div>
+  <span class="lbl" id="ridLbl">ID</span><span class="val" id="rid">-</span>
+  <span class="lbl pw" id="pwLbl">PW</span><span class="val pw" id="pw">-</span>
 </div>
 <script>
   const box = document.getElementById("box");
   let lastKey = null;
+
+  // The box's look, chosen in the app ("Customise box"). Anything missing or invalid keeps the default look.
+  let lastStyle = null, flashOn = true;
+  function applyStyle(st) {
+    st = st || {};
+    const json = JSON.stringify(st);
+    if (json === lastStyle) return;
+    lastStyle = json;
+    const color = (v, d) => /^#[0-9a-fA-F]{6}$/.test(v || "") ? v : d;
+    const num = (v, lo, hi, d) => (typeof v === "number" || (typeof v === "string" && v.trim() !== ""))
+      && Number.isFinite(+v) ? Math.min(hi, Math.max(lo, +v)) : d;
+    const pick = (v, list, d) => list.includes(v) ? v : d;
+    const text = (v, d) => typeof v === "string" ? v.slice(0, 20) : d;
+    const rgba = (hex, a) => `rgba(${[1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)).join(", ")}, ${a})`;
+    const em = v => v / 100 + "em";
+    const s = box.style, bg = document.getElementById("bg"), wrap = document.getElementById("bgwrap");
+    const labels = st.show_labels !== false, row = st.layout === "row";
+    const textColor = color(st.text_color, "#ffffff");
+
+    // text
+    s.fontFamily = `"${text(st.font, "Segoe UI").replace(/["\;{}<>]/g, "")}", "Segoe UI", Arial, sans-serif`;
+    s.fontSize = num(st.size, 10, 300, 64) + "px";
+    s.fontWeight = String(pick(+st.weight, [300, 400, 500, 600, 700, 800, 900], 800));
+    s.fontStyle = st.italic === true ? "italic" : "normal";
+    s.color = textColor;
+    s.letterSpacing = em(num(st.letter_spacing, -20, 100, 2));
+    s.lineHeight = String(num(st.line_height, 50, 300, 115) / 100);
+    const ow = num(st.outline_width, 0, 30, 0);
+    s.setProperty("-webkit-text-stroke", ow ? `${ow}px ${color(st.outline_color, "#000000")}` : "0");
+    s.textShadow = st.shadow === false ? "none" : `0 ${num(st.shadow_y, -50, 50, 2)}px ${num(st.shadow_blur, 0, 80, 6)}px `
+      + rgba(color(st.shadow_color, "#000000"), num(st.shadow_opacity, 0, 100, 50) / 100);
+
+    // spacing, layout, animation
+    s.padding = `${em(num(st.pad_y, 0, 300, 25))} ${em(num(st.pad_x, 0, 400, 60))}`;
+    s.columnGap = em(num(st.col_gap, 0, 600, 160));
+    s.rowGap = em(num(st.row_gap, 0, 300, 5));
+    s.gridTemplateColumns = Array((labels ? 2 : 1) * (row ? 2 : 1)).fill("auto").join(" ");
+    box.dataset.anim = pick(st.anim, ["zoom", "fade", "slide", "pop", "none"], "zoom");
+    flashOn = st.flash !== false;
+    s.setProperty("--flash", color(st.flash_color, "#ffffff"));
+
+    // box shape, fill, border, glow
+    const a = num(st.box_opacity, 0, 100, 82) / 100, c1 = color(st.box_color, "#141418");
+    bg.style.background = st.gradient === true
+      ? `linear-gradient(${num(st.gradient_angle, 0, 360, 135)}deg, ${rgba(c1, a)}, ${rgba(color(st.box_color2, "#6a3093"), a)})`
+      : rgba(c1, a);
+    const bw = num(st.border_width, 0, 40, 0);
+    bg.style.border = bw ? `${bw}px solid ${color(st.border_color, "#ffffff")}` : "none";
+    const shape = pick(st.shape, ["rounded", "pill", "square", "cut", "slant"], "rounded");
+    const r = num(st.radius, 0, 200, 10);
+    bg.style.borderRadius = shape === "pill" ? "9999px" : (shape === "square" || shape === "cut") ? "0" : r + "px";
+    bg.style.clipPath = shape !== "cut" ? "none" : `polygon(${r}px 0, calc(100% - ${r}px) 0, 100% ${r}px, `
+      + `100% calc(100% - ${r}px), calc(100% - ${r}px) 100%, ${r}px 100%, 0 calc(100% - ${r}px), 0 ${r}px)`;
+    bg.style.transform = shape === "slant" ? "skewX(-12deg)" : "none";
+    const glow = num(st.glow_size, 0, 100, 0), gc = color(st.glow_color, "#f5b400");
+    wrap.style.filter = glow ? `drop-shadow(0 0 ${glow / 2}px ${gc}) drop-shadow(0 0 ${glow}px ${gc})` : "none";
+
+    // labels and numbers
+    document.querySelectorAll(".lbl").forEach(el => {
+      el.style.display = labels ? "" : "none";
+      el.style.color = color(st.label_color, textColor);
+      el.style.fontSize = em(num(st.label_size, 20, 300, 100));
+    });
+    document.querySelectorAll(".val").forEach(el => el.style.textAlign = pick(st.align, ["left", "center", "right"], "right"));
+    document.getElementById("ridLbl").textContent = text(st.id_label, "ID");
+    document.getElementById("pwLbl").textContent = text(st.pw_label, "PW");
+  }
+
   async function tick() {
     try {
       const s = await (await fetch("/state?overlay=1", { cache: "no-store" })).json();
+      applyStyle(s.style);
       const rid = s.display_room_id, pw = s.display_password;
-      box.classList.toggle("show", !!(s.visible && rid));
+      box.classList.toggle("show", !!s.on_stream);
       document.querySelectorAll(".pw").forEach(el => el.classList.toggle("hidden", !pw));
       const key = rid + "|" + pw;
       if (key !== lastKey) {
         document.getElementById("rid").textContent = rid || "-";
         document.getElementById("pw").textContent = pw || "-";
-        if (lastKey !== null && rid) {
+        if (lastKey !== null && rid && flashOn) {
           box.classList.remove("flash"); void box.offsetWidth; box.classList.add("flash");
         }
         lastKey = key;
