@@ -41,8 +41,17 @@ The wizard does the rest:
 5. **LIVE Studio:** *Copy link* → Add source → Link → paste. The app shows a ✓ once LIVE Studio
    is connected, so she knows it worked.
 
-After that it opens to a simple screen showing what's on stream, with a password box and a
-*Run setup again* button.
+After that it opens to a simple screen showing what's on stream, with a password box.
+
+**Settings** (top right) has *Open with TikTok LIVE Studio* (off until she turns it on), update
+checks, and *Run setup again*.
+
+## Releasing an update
+
+Change the number in `version.txt` and push to `main`. The workflow publishes a GitHub Release, and
+the app shows a *New update available* banner on its main screen the next time it opens, which
+leads to **Settings > Updates**. Pushes that don't change `version.txt`
+build as usual but aren't offered to anyone.
 
 ## If something's off
 - **Every device is black:** her Elgato may not allow two apps at once. The wizard then offers
@@ -53,6 +62,9 @@ After that it opens to a simple screen showing what's on stream, with a password
 ## Files
 - `app.py`: desktop app and setup wizard
 - `roomid.py`: OCR and overlay engine (also usable from the command line)
+- `watcher.py`: small background program that opens the app when LIVE Studio opens
+- `updater.py`: finds and installs new versions from GitHub Releases
+- `version.txt`: this build's version number
 - `overlay.html`: the box shown on stream
 - `example_room.png`, `example_roomid.png`: pictures shown in the wizard
 - `installer.iss`, `build.bat`, `requirements-build.txt`, `.github/workflows/build.yml`: packaging

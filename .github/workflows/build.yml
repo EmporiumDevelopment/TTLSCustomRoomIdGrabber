@@ -28,6 +28,8 @@ jobs:
 
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write  # publishes the GitHub Release the app updates from
     steps:
       - uses: actions/checkout@v4
 
@@ -49,7 +51,7 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --windowed --name RoomIDOverlay
           --add-data "overlay.html;." --add-data "control.html;." --add-data "example_room.png;." --add-data "example_roomid.png;."
-          --add-data "overlay_url.txt;."
+          --add-data "overlay_url.txt;." --add-data "version.txt;."
           --collect-all rapidocr_onnxruntime --collect-binaries onnxruntime --collect-all windows_capture
           --hidden-import pygrabber.dshow_graph
           app.py
@@ -64,3 +66,16 @@ jobs:
         with:
           name: RoomIDOverlay-Setup
           path: Output/RoomIDOverlay-Setup.exe
+
+      # Installed apps offer the update as soon as this publishes, so it only happens on a new version.txt
+      - name: Publish release if version.txt is new
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(tr -d '[:space:]' < version.txt)"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "$tag is already released"
+          else
+            gh release create "$tag" Output/RoomIDOverlay-Setup.exe --title "$tag" --generate-notes --target "$GITHUB_SHA"
+          fi

@@ -6,6 +6,12 @@ First launch walks through setup one screen at a time:
   password > add to TikTok LIVE Studio (auto-detected) > done
 After that it opens to a small everyday screen.
 """
+import sys
+
+if "--watch" in sys.argv:  # the background watcher: stop here, before the heavy imports below
+    import watcher
+    raise SystemExit(watcher.run())
+
 import functools
 import json
 import os
@@ -22,9 +28,11 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import roomid as core
+import updater
+import watcher
 
 APP_NAME = "Room ID Overlay"
-PORT = 8080
+PORT = watcher.APP_PORT
 LOCAL_URL = f"http://localhost:{PORT}/"
 RELAY = os.environ.get("ROOMID_RELAY", "https://ntfy.sh/")  # free relay: the app posts updates, the overlay page listens
 
@@ -38,11 +46,17 @@ def overlay_base():
 SCREEN = "screen"
 SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "RoomIDOverlay"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+UPDATE_FILE = SETTINGS_DIR / "update" / updater.INSTALLER
 
 BG, PANEL, TEXT, MUTED, ACCENT, GOOD, BAD = (
-    "#16181d", "#20232a", "#f1f1f1", "#9aa0a6", "#f5b400", "#4cd07d", "#ff6b6b")
+    "#262626", "#303030", "#ececec", "#9b9b9b", "#f5b400", "#4cd07d", "#ff6b6b")
+FIELD, BUTTON, BUTTON_HOVER, TOPBAR, SIDEBAR, SELECTED, DIVIDER = (
+    "#1b1b1b", "#4d4d4d", "#5c5c5c", "#0c0c0c", "#1f1f1f", "#484848", "#3d3d3d")
+NOTICE, NOTICE_HOVER = "#8ab8e6", "#a3c8ee"
 FONT = "Segoe UI"
+FONT_SEMI = "Segoe UI Semibold"
 WIDTH = 640
+HEIGHT = 764
 STEPS = ["Game", "Room", "Room ID", "Password", "LIVE Studio"]
 
 # How the Room ID box looks on stream. These defaults are the original look; "Customise box" changes them.
@@ -121,6 +135,42 @@ def load_font(family, px, weight=400, italic=False):
 
 def _rgb(hex_color):
     return tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+SWITCH_FRAMES = 8
+FADE_SECONDS = 0.18
+
+
+def smooth(t):
+    """Eases 0..1 so movement starts and stops gently."""
+    return t * t * (3 - 2 * t)
+
+
+@functools.lru_cache(maxsize=None)
+def switch_image(frame):
+    """One frame of the on/off switch (0 = off, SWITCH_FRAMES = on), drawn large and shrunk so its curves are smooth."""
+    from PIL import ImageDraw
+    t = smooth(frame / SWITCH_FRAMES)
+    scale, w, h = 4, 36, 18
+    color = tuple(round(off + (on - off) * t) for off, on in zip(_rgb(BUTTON), _rgb(GOOD)))
+    img = Image.new("RGB", (w * scale, h * scale), _rgb(BG))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, w * scale - 1, h * scale - 1], h * scale // 2, fill=color)
+    inset, knob = 2 * scale, (h - 4) * scale
+    left = inset + round((w * scale - 2 * inset - knob) * t)
+    draw.ellipse([left, inset, left + knob, inset + knob], fill=(255, 255, 255))
+    return ImageTk.PhotoImage(img.resize((w, h), Image.LANCZOS))
+
+
+def animations_enabled():
+    """Follows Windows' own "Animation effects" setting."""
+    try:
+        import ctypes
+        on = ctypes.c_int(1)
+        ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(on), 0)  # SPI_GETCLIENTAREAANIMATION
+        return bool(on.value)
+    except Exception:
+        return True
 
 
 def render_box(st, room_id="12345678", password="1234"):
@@ -826,6 +876,9 @@ class App:
         self.devices = list_devices()
         self.page_tick = None
         self.images = []
+        self.update, self.update_banner, self.update_status = None, None, None
+        self.update_check, self.updating, self.update_dismissed = None, False, False
+        self.animate, self.fading = animations_enabled(), False
 
         if self.settings.get("password"):
             self.state.apply({"manual_password": self.settings["password"]})
@@ -833,6 +886,10 @@ class App:
                           "style": {**DEFAULT_STYLE, **self.settings.get("style", {})}})
 
         self._start_server()
+        try:
+            watcher.refresh()
+        except OSError as e:
+            print("Couldn't restart the LIVE Studio watcher:", e)
         self.scanner = Scanner(self.capture, self.state, self.settings)
         if not self.settings.get("topic"):  # this install's private channel
             import secrets
@@ -848,6 +905,7 @@ class App:
             self.page_dashboard()
         else:
             self.page_welcome()
+        self._check_for_update()
         self._tick()
 
     # plumbing ---------------------------------------------------------------
@@ -865,32 +923,133 @@ class App:
         r = self.root
         r.title(APP_NAME)
         r.configure(bg=BG)
-        r.geometry(f"{WIDTH}x720")
+        r.geometry(f"{WIDTH}x{HEIGHT}")
         r.resizable(False, False)
         style = ttk.Style(r)
         style.theme_use("clam")
-        style.configure("TButton", font=(FONT, 11), padding=(14, 8), background="#333", foreground=TEXT,
-                        borderwidth=0)
-        style.map("TButton", background=[("active", "#444"), ("disabled", "#2a2a2a")],
-                  foreground=[("disabled", "#666")])
-        style.configure("Big.TButton", font=(FONT, 12, "bold"), padding=(20, 10), background=ACCENT,
-                        foreground="#111")
+        style.configure("TButton", font=(FONT, 10), padding=(14, 5), background=BUTTON, foreground=TEXT,
+                        borderwidth=0, focuscolor=BUTTON)
+        style.map("TButton", background=[("active", BUTTON_HOVER), ("disabled", PANEL)],
+                  foreground=[("disabled", "#777")])
+        style.configure("Big.TButton", font=(FONT_SEMI, 10), padding=(18, 6), background=ACCENT,
+                        foreground="#111", focuscolor=ACCENT)
         style.map("Big.TButton", background=[("active", "#ffd040"), ("disabled", "#5a4a10")])
-        style.configure("TCombobox", fieldbackground="#0e0f12", background="#333", foreground=TEXT,
-                        arrowcolor=TEXT, padding=4)
-        style.map("TCombobox", fieldbackground=[("readonly", "#0e0f12")], foreground=[("readonly", TEXT)],
-                  selectbackground=[("readonly", "#0e0f12")], selectforeground=[("readonly", TEXT)])
-        r.option_add("*TCombobox*Listbox.background", "#0e0f12")
+        style.configure("TCombobox", fieldbackground=FIELD, background=BUTTON, foreground=TEXT,
+                        arrowcolor=TEXT, padding=4, bordercolor=DIVIDER, lightcolor=FIELD, darkcolor=FIELD)
+        style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", TEXT)],
+                  selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", TEXT)])
+        r.option_add("*TCombobox*Listbox.background", FIELD)
         r.option_add("*TCombobox*Listbox.foreground", TEXT)
         r.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         r.option_add("*TCombobox*Listbox.selectForeground", "#111")
         r.option_add("*TCombobox*Listbox.font", (FONT, 11))
-        style.configure("Style.TNotebook", background=BG, borderwidth=0, tabmargins=0)
-        style.configure("Style.TNotebook.Tab", background="#2a2d35", foreground=MUTED, padding=(9, 5),
-                        font=(FONT, 10), borderwidth=0)
-        style.map("Style.TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", TEXT)])
+        style.configure("Style.TNotebook", background=BG, borderwidth=0, tabmargins=0, bordercolor=PANEL,
+                        lightcolor=PANEL, darkcolor=PANEL)
+        style.configure("Style.TNotebook.Tab", background=SIDEBAR, foreground=MUTED, padding=(9, 5),
+                        font=(FONT, 10), borderwidth=0, bordercolor=SIDEBAR, lightcolor=SIDEBAR, darkcolor=SIDEBAR,
+                        focuscolor=PANEL)
+        style.map("Style.TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", TEXT)],
+                  bordercolor=[("selected", PANEL)], lightcolor=[("selected", PANEL)],
+                  darkcolor=[("selected", PANEL)])
+        self._dark_title_bar()
+        topbar = tk.Frame(r, bg=TOPBAR, height=44)
+        topbar.pack(fill="x")
+        topbar.pack_propagate(False)
+        tk.Label(topbar, text=APP_NAME, bg=TOPBAR, fg=TEXT, font=(FONT_SEMI, 12)).pack(side="left", padx=(18, 14))
+        self.nav = tk.Frame(topbar, bg=TOPBAR)
+        # Made once and only recoloured: a new Tk button draws white for a moment, and nothing covers this bar
+        self.nav_links = {}
+        for key, text, page, side in (("home", "Home", self.page_dashboard, "left"),
+                                      ("style", "Customise box", self.page_style, "left"),
+                                      ("settings", "⚙  Settings", self.page_settings, "right")):
+            self.nav_links[key] = self._flat_button(self.nav, text, page, bg=TOPBAR, selected_bg=TOPBAR)
+            self.nav_links[key].pack(side=side, fill="y", padx=(0, 8 if side == "right" else 0))
         self.body = tk.Frame(r, bg=BG)
         self.body.pack(fill="both", expand=True)
+        self.cover = tk.Toplevel(r, bg=BG)  # floats over the page during a page change; see _begin_fade
+        self.cover.withdraw()
+        self.cover.overrideredirect(True)
+        self.cover.transient(r)
+        self.cover_image = tk.Label(self.cover, bd=0, bg=BG)
+        self.cover_image.pack()
+
+    def _hwnd(self):
+        import ctypes
+        return ctypes.windll.user32.GetParent(self.root.winfo_id())
+
+    def _dark_title_bar(self):
+        try:
+            import ctypes
+            self.root.update_idletasks()
+            on = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(self._hwnd(), 20, ctypes.byref(on), ctypes.sizeof(on))
+        except Exception as e:  # older Windows: the title bar just stays light
+            print("Dark title bar unavailable:", e)
+
+    def _window_in_front(self):
+        import ctypes
+        return ctypes.windll.user32.GetForegroundWindow() == self._hwnd()
+
+    def _begin_fade(self):
+        """Covers the old page with a picture of itself so the new page gets built out of sight, then
+        fades the picture away. Tk can't fade its own widgets, but Windows can fade a whole window."""
+        if self.fading or not self.animate or not self.body.winfo_children() or not self._window_in_front():
+            return
+        root, body = self.root, self.body
+        x, y, w, h = body.winfo_rootx(), body.winfo_rooty(), body.winfo_width(), body.winfo_height()
+        try:
+            frame = _print_window(self._hwnd(), root.winfo_width(), root.winfo_height())
+            if is_black(frame):
+                return
+            left, top = x - root.winfo_rootx(), y - root.winfo_rooty()
+            self.cover_photo = ImageTk.PhotoImage(Image.fromarray(frame[top:top + h, left:left + w, ::-1]))
+        except Exception as e:  # never let a visual effect get in the way of changing page
+            print("Page fade skipped:", e)
+            return
+        self.fading = True
+        self.cover_image.configure(image=self.cover_photo)
+        self.cover.geometry(f"{w}x{h}+{x}+{y}")
+        self.cover.attributes("-alpha", 0)
+        self.cover.deiconify()
+        self.cover.update()  # let it draw while still invisible, so it can't flash either
+        self.cover.attributes("-alpha", 1)
+        self.root.after(30, self._fade_cover)  # by now the new page exists and has drawn underneath
+
+    def _fade_cover(self):
+        start = time.perf_counter()
+
+        def step():
+            t = (time.perf_counter() - start) / FADE_SECONDS
+            if t < 1:
+                self.cover.attributes("-alpha", 1 - smooth(t))
+                self.root.after(8, step)
+                return
+            self.cover.withdraw()
+            self.cover_image.configure(image="")
+            self.cover_photo, self.fading = None, False
+
+        step()
+
+    def _flat_button(self, parent, text, command, selected=False, bg=SIDEBAR, selected_bg=SELECTED):
+        b = tk.Button(parent, text=text, command=command, bg=selected_bg if selected else bg,
+                      fg=TEXT if selected else MUTED, activebackground=selected_bg if selected else bg,
+                      activeforeground=TEXT, relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                      font=(FONT, 11), anchor="w", padx=14, pady=5)
+        b.selected = selected
+        b.bind("<Enter>", lambda _: b.configure(fg=TEXT))
+        b.bind("<Leave>", lambda _: b.configure(fg=TEXT if b.selected else MUTED))
+        return b
+
+    def _show_nav(self, current):
+        """Highlights the current top bar link. Setup pages pass nothing, so the wizard can't be left halfway."""
+        self.page_nav = current
+        if current:
+            self.nav.pack(side="left", fill="both", expand=True)
+        else:
+            self.nav.pack_forget()
+        for key, link in self.nav_links.items():
+            link.selected = key == current
+            link.configure(fg=TEXT if link.selected else MUTED)
 
     def _tick(self):
         if self.page_tick:
@@ -898,7 +1057,92 @@ class App:
                 self.page_tick()
             except tk.TclError:
                 pass
+        self._update_tick()
         self.root.after(300, self._tick)
+
+    # updates ----------------------------------------------------------------
+    def _check_for_update(self):
+        self.update_check, self.update_status = "checking", None
+
+        def work():
+            try:
+                UPDATE_FILE.unlink(missing_ok=True)  # left over from the last update
+            except OSError:
+                pass
+            try:
+                self.update = updater.find_update()
+                self.update_check = "done"
+            except Exception as e:  # offline, or GitHub is down
+                print("Update check failed:", e)
+                self.update_check = "error"
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_text(self):
+        if self.update_status:
+            return self.update_status
+        if self.update:
+            return f"Version {self.update['version']} is available"
+        return {"checking": "Checking...", "error": "Couldn't check. Try again later."}.get(
+            self.update_check, "You're on the latest version")
+
+    def _update_tick(self):
+        """Shows what the background update work left behind (only this thread can touch the window)."""
+        if self.update and not self.update_dismissed and self.page_nav == "home" and not self.update_banner:
+            self._show_update_banner()
+
+    def _show_update_banner(self):
+        """Slides down at the top of Home. Part of the page, so it goes away when the page changes."""
+        full_height = 38
+        banner = self.update_banner = tk.Frame(self.body, bg=NOTICE, height=1)
+        banner.pack_propagate(False)
+        banner.pack(fill="x", before=self.body.winfo_children()[0])
+
+        def clickable(text, command, **options):  # labels, as a new Tk button would draw white for a moment
+            label = tk.Label(banner, text=text, bg=NOTICE, fg="#111", cursor="hand2", takefocus=1, **options)
+            label.bind("<Button-1>", lambda _: command())
+            label.bind("<space>", lambda _: command())
+            label.bind("<Enter>", lambda _: label.configure(bg=NOTICE_HOVER))
+            label.bind("<Leave>", lambda _: label.configure(bg=NOTICE))
+            return label
+
+        clickable("✕", self._dismiss_update_banner, font=(FONT, 11), padx=14).pack(side="right", fill="y")
+        clickable("New update available. Click to update.", lambda: self.page_settings("Updates"),
+                  font=(FONT_SEMI, 11), anchor="w", padx=28).pack(side="left", fill="both", expand=True)
+
+        def slide(height=1):
+            if banner.winfo_exists():
+                banner.configure(height=height)
+                if height < full_height:
+                    self.root.after(12, slide, min(height + 4, full_height))
+
+        slide()
+
+    def _dismiss_update_banner(self):
+        self.update_dismissed = True  # Settings > Updates still offers it
+        self.update_banner.destroy()
+        self.update_banner = None
+
+    def _start_update(self):
+        self.updating = True
+        self.update_status = "Downloading update..."
+
+        def progress(fraction):
+            self.update_status = f"Downloading update... {fraction:.0%}"
+
+        def work():
+            try:
+                updater.download(self.update, UPDATE_FILE, progress)
+                self.update_status = "Installing update..."
+                updater.install(UPDATE_FILE)
+            except Exception as e:
+                print("Update failed:", e)
+                self.update_status = "Update failed. Check your internet and try again."
+                self.updating = False
+                return
+            os._exit(0)  # the installer replaces these files and reopens the app
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _save(self, **kw):
         self.settings.update(kw)
@@ -924,14 +1168,21 @@ class App:
         return self.state.overlay_seen > 0
 
     # page building helpers --------------------------------------------------
-    def _page(self, step=None, title="", text=""):
-        """Clear the window and start a new page. Returns the content frame."""
+    def _page(self, step=None, title="", text="", nav=None, bare=False):
+        """Clear the window and start a new page. Returns the content frame (bare: the whole page, unpadded)."""
         self.page_tick = None
         self.images = []
         if self.state.data.get("preview"):  # leaving "Customise box": stop the sample on stream
             self.state.apply({"preview": False})
+        self._begin_fade()
         for w in self.body.winfo_children():
             w.destroy()
+        self.update_banner = None
+        self._show_nav(nav)
+        if bare:
+            page = tk.Frame(self.body, bg=BG)
+            page.pack(fill="both", expand=True)
+            return page
         if step is not None:
             bar = tk.Frame(self.body, bg=BG)
             bar.pack(fill="x", padx=28, pady=(20, 0))
@@ -940,10 +1191,10 @@ class App:
                 mark = "✓" if i < step else str(i + 1)
                 tk.Label(bar, text=f"{mark}  {name}", bg=BG, fg=color,
                          font=(FONT, 10, "bold" if i == step else "normal")).pack(side="left", padx=(0, 18))
-        tk.Label(self.body, text=title, bg=BG, fg=TEXT, font=(FONT, 20, "bold"), anchor="w",
-                 justify="left", wraplength=WIDTH - 56).pack(fill="x", padx=28, pady=(18, 6))
+        tk.Label(self.body, text=title, bg=BG, fg=TEXT, font=(FONT_SEMI, 16), anchor="w",
+                 justify="left", wraplength=WIDTH - 56).pack(fill="x", padx=28, pady=(18, 4))
         if text:
-            tk.Label(self.body, text=text, bg=BG, fg=MUTED, font=(FONT, 12), anchor="w", justify="left",
+            tk.Label(self.body, text=text, bg=BG, fg=MUTED, font=(FONT, 11), anchor="w", justify="left",
                      wraplength=WIDTH - 56).pack(fill="x", padx=28)
         content = tk.Frame(self.body, bg=BG)
         content.pack(fill="both", expand=True, padx=28, pady=14)
@@ -1224,7 +1475,7 @@ class App:
                        "The game doesn't show the password, so type it here. It stays the same for "
                        "every room until you change it (you can change it any time).")
         var = tk.StringVar(value=self.settings.get("password", ""))
-        e = tk.Entry(c, textvariable=var, font=(FONT, 22), width=12, bg="#0e0f12", fg=TEXT,
+        e = tk.Entry(c, textvariable=var, font=(FONT, 22), width=12, bg=FIELD, fg=TEXT,
                      insertbackground=TEXT, relief="flat", justify="center")
         e.pack(anchor="w", pady=(10, 0), ipady=8)
         e.focus_set()
@@ -1238,6 +1489,17 @@ class App:
         e.bind("<Return>", lambda _: nxt())
         self._button("Next", nxt)
         self._button("Back", self.page_confirm, primary=False, side="left")
+
+    def _copy_link(self, button):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.overlay_url)
+        button.configure(text="Copied!")
+
+        def restore():
+            if button.winfo_exists():  # the page may have changed since
+                button.configure(text="Copy link")
+
+        self.root.after(1500, restore)
 
     def page_ttls(self):
         c = self._page(4, "Add the box to TikTok LIVE Studio",
@@ -1256,21 +1518,14 @@ class App:
             tk.Label(row, text="  " + s, bg=BG, fg=TEXT, font=(FONT, 12), anchor="w").pack(side="left")
         copy_row = tk.Frame(c, bg=BG)
         copy_row.pack(fill="x", pady=(14, 0))
-        link = tk.Entry(copy_row, font=(FONT, 10), width=44, bg="#0e0f12", fg=MUTED,
-                        readonlybackground="#0e0f12", relief="flat")
+        link = tk.Entry(copy_row, font=(FONT, 10), width=44, bg=FIELD, fg=MUTED,
+                        readonlybackground=FIELD, relief="flat")
         link.insert(0, self.overlay_url)
         link.configure(state="readonly")
         link.pack(side="left", ipady=6)
-        copy_btn = ttk.Button(copy_row, text="Copy link", style="Big.TButton")
+        copy_btn = ttk.Button(copy_row, text="Copy link", style="Big.TButton",
+                              command=lambda: self._copy_link(copy_btn))
         copy_btn.pack(side="left", padx=10)
-
-        def copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self.overlay_url)
-            copy_btn.configure(text="Copied!")
-            self.root.after(1500, lambda: copy_btn.configure(text="Copy link"))
-
-        copy_btn.configure(command=copy)
         status = self._status(c, "", size=13)
         tip = self._status(c, "Tip: you can hide your old ID / PW text in LIVE Studio now.", size=11)
         nxt = self._button("Next", self.page_done)
@@ -1295,7 +1550,7 @@ class App:
     # --------------------------------------------------------- dashboard ---
     def page_dashboard(self):
         c = self._page(None, "Room ID Overlay is running",
-                       "Leave this open while you stream. You can minimise it.")
+                       "Leave this open while you stream. You can minimise it.", nav="home")
         panel = tk.Frame(c, bg=PANEL, padx=18, pady=16)
         panel.pack(fill="x")
         live_label = tk.Label(panel, text="On stream now", bg=PANEL, fg=MUTED, font=(FONT, 11))
@@ -1316,7 +1571,7 @@ class App:
         row.pack(fill="x", pady=(18, 0))
         tk.Label(row, text="Password", bg=BG, fg=TEXT, font=(FONT, 12), width=9, anchor="w").pack(side="left")
         pw_var = tk.StringVar(value=self.settings.get("password", ""))
-        pw = tk.Entry(row, textvariable=pw_var, font=(FONT, 14), width=12, bg="#0e0f12", fg=TEXT,
+        pw = tk.Entry(row, textvariable=pw_var, font=(FONT, 14), width=12, bg=FIELD, fg=TEXT,
                       insertbackground=TEXT, relief="flat")
         pw.pack(side="left", ipady=5)
 
@@ -1336,7 +1591,7 @@ class App:
         row2.pack(fill="x", pady=(12, 0))
         tk.Label(row2, text="Wrong ID?", bg=BG, fg=TEXT, font=(FONT, 12), width=9, anchor="w").pack(side="left")
         rid_var = tk.StringVar()
-        rid = tk.Entry(row2, textvariable=rid_var, font=(FONT, 14), width=12, bg="#0e0f12", fg=TEXT,
+        rid = tk.Entry(row2, textvariable=rid_var, font=(FONT, 14), width=12, bg=FIELD, fg=TEXT,
                        insertbackground=TEXT, relief="flat")
         rid.pack(side="left", ipady=5)
         set_rid = lambda: self.state.apply({"manual_room_id": rid_var.get().strip()})
@@ -1344,19 +1599,6 @@ class App:
         ttk.Button(row2, text="Use this", command=set_rid).pack(side="left", padx=8)
         tk.Label(c, text="Only if the ID on stream is wrong. A new room replaces it automatically.",
                  bg=BG, fg=MUTED, font=(FONT, 10), anchor="w").pack(fill="x", pady=(4, 0))
-
-        vis = tk.BooleanVar(value=self.settings.get("visible", True))
-
-        def toggle():
-            self._save(visible=vis.get())
-            self.state.apply({"visible": vis.get()})
-
-        tk.Checkbutton(c, text="Show the box automatically when a room is open", variable=vis, command=toggle, bg=BG, fg=TEXT,
-                       selectcolor="#0e0f12", activebackground=BG, activeforeground=TEXT,
-                       font=(FONT, 12)).pack(anchor="w", pady=(16, 0))
-
-        self._button("Run setup again", self._restart_setup, primary=False, side="left")
-        self._button("Customise box", self.page_style, primary=False)
 
         def tick():
             s = self.state.snapshot()
@@ -1367,7 +1609,7 @@ class App:
             else:
                 live.configure(text="Hidden", fg=MUTED)
                 live_label.configure(text="On stream now (shows when a custom room is open)"
-                                     if s["visible"] else "On stream now (turned off below)")
+                                     if s["visible"] else "On stream now (turned off in Settings)")
             f = self.capture.get()
             cr = crop(f, self.settings.get("region"))
             if cr is not None:
@@ -1383,6 +1625,121 @@ class App:
             bad = err or game[1] == BAD or ttls[1] == BAD
             checks.configure(text=f"{game[0]}\n{ttls[0]}{err}", fg=BAD if bad else GOOD)
         self.page_tick = tick
+
+    # ---------------------------------------------------------- settings ---
+    def page_settings(self, section="General"):
+        page = self._page(nav="settings", bare=True)
+        side = tk.Frame(page, bg=SIDEBAR, width=180)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        tk.Label(side, text="Settings", bg=SIDEBAR, fg=TEXT, font=(FONT_SEMI, 13), anchor="w").pack(
+            fill="x", padx=18, pady=(18, 10))
+        sections = {"General": self._settings_general, "Updates": self._settings_updates, "Setup": self._settings_setup}
+        for name in sections:
+            self._flat_button(side, name, lambda n=name: self.page_settings(n), selected=name == section).pack(
+                fill="x", padx=10, pady=1)
+
+        main = tk.Frame(page, bg=BG)
+        main.pack(side="left", fill="both", expand=True, padx=22, pady=(20, 14))
+        tk.Label(main, text="Changes are saved automatically.", bg=BG, fg=MUTED, font=(FONT, 9), anchor="w").pack(
+            side="bottom", fill="x")
+        tk.Frame(main, bg=DIVIDER, height=1).pack(side="bottom", fill="x", pady=(0, 8))
+        rows = tk.Frame(main, bg=BG)
+        rows.pack(fill="x")
+        rows.columnconfigure(0, minsize=210)
+        sections[section](rows)
+
+    def _setting_row(self, parent, label):
+        """Adds the row's label and returns its row number, for placing the control in column 1."""
+        row = parent.grid_size()[1]
+        tk.Label(parent, text=label, bg=BG, fg=TEXT if label else BG, font=(FONT, 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=9)
+        return row
+
+    def _setting_text(self, parent, row, text=""):
+        lbl = tk.Label(parent, text=text, bg=BG, fg=MUTED, font=(FONT, 10), anchor="w", justify="left", wraplength=190)
+        lbl.grid(row=row, column=1, sticky="w")
+        return lbl
+
+    def _switch(self, parent, row, get, put):
+        frame = target = SWITCH_FRAMES if get() else 0
+        running = False
+        lbl = tk.Label(parent, bg=BG, cursor="hand2", takefocus=1, image=switch_image(frame))
+
+        def step():
+            nonlocal frame, running
+            if not lbl.winfo_exists():
+                return
+            if frame == target:
+                running = False
+                return
+            frame += 1 if target > frame else -1
+            lbl.configure(image=switch_image(frame))
+            self.root.after(16, step)
+
+        def flip(_=None):
+            nonlocal frame, target, running
+            put(not get())
+            target = SWITCH_FRAMES if get() else 0  # read back: the change may have failed
+            if not self.animate:
+                frame = target
+                lbl.configure(image=switch_image(frame))
+            elif not running:  # if it's already moving, it simply heads for the new target
+                running = True
+                step()
+
+        lbl.bind("<Button-1>", flip)
+        lbl.bind("<space>", flip)
+        lbl.grid(row=row, column=1, sticky="w")
+
+    def _settings_general(self, p):
+        def put_auto_open(on):
+            try:
+                watcher.set_enabled(on)
+            except OSError as e:
+                messagebox.showerror(APP_NAME, f"Couldn't change that setting.\n\n{e}")
+
+        def put_visible(on):
+            self._save(visible=on)
+            self.state.apply({"visible": on})
+
+        self._switch(p, self._setting_row(p, "Open with TikTok LIVE Studio"), watcher.is_enabled, put_auto_open)
+        self._switch(p, self._setting_row(p, "Show box when a room is open"),
+                     lambda: self.settings.get("visible", True), put_visible)
+
+    def _settings_updates(self, p):
+        self.update_dismissed = True  # they've seen it now: no need for the banner on Home as well
+        try:
+            version = updater.current_version()
+        except OSError:
+            version = "Unknown"
+        self._setting_text(p, self._setting_row(p, "Installed version"), version)
+        status = self._setting_text(p, self._setting_row(p, "Status"))
+        check = ttk.Button(p, text="Check for updates", command=self._check_for_update)
+        check.grid(row=self._setting_row(p, ""), column=1, sticky="w", pady=(6, 0))
+        now = ttk.Button(p, text="Update now", command=self._start_update, style="Big.TButton")
+        now_row = self._setting_row(p, "")
+        now.grid(row=now_row, column=1, sticky="w")
+
+        def tick():
+            status.configure(text=self._update_text())
+            check.configure(state="disabled" if self.updating or self.update_check == "checking" else "normal")
+            now.configure(state="disabled" if self.updating else "normal")
+            if self.update:
+                now.grid()
+            else:
+                now.grid_remove()
+
+        tick()
+        self.page_tick = tick
+
+    def _settings_setup(self, p):
+        source = "Your whole screen" if self.settings.get("source") == SCREEN else self.settings.get("source_name")
+        self._setting_text(p, self._setting_row(p, "Game source"), source or "Not set")
+        copy = ttk.Button(p, text="Copy link", command=lambda: self._copy_link(copy))
+        copy.grid(row=self._setting_row(p, "LIVE Studio link"), column=1, sticky="w")
+        ttk.Button(p, text="Run setup again", command=self._restart_setup).grid(
+            row=self._setting_row(p, "Change game or Room ID area"), column=1, sticky="w")
 
     # ------------------------------------------------------- box style ---
     # Every setting on the "Customise box" page: tab -> [(setting, label, kind, options)]
@@ -1451,7 +1808,8 @@ class App:
         from tkinter import font as tkfont
 
         c = self._page(None, "Customise your Room ID box",
-                       "Changes go on stream straight away, with a sample box shown while this page is open.")
+                       "Changes go on stream straight away, with a sample box shown while this page is open.",
+                       nav="style")
         self.state.apply({"preview": True})
         st = {**DEFAULT_STYLE, **self.settings.get("style", {})}
         pw_, ph_ = WIDTH - 56, 170
@@ -1469,6 +1827,9 @@ class App:
             jobs[name] = self.root.after(ms, fn)
 
         def draw():
+            jobs["draw"] = None
+            if not preview.winfo_exists():
+                return
             k = min(1.0, 90 / st["size"])  # big text: draw a scaled-down copy so sliders stay smooth
             small = {**st, **{key: st[key] * k for key in ("size", "radius", "border_width", "glow_size",
                                                            "shadow_blur", "shadow_y", "outline_width")}}
@@ -1488,7 +1849,8 @@ class App:
             preview.configure(image=photo, width=pw_, height=ph_)
 
         def changed():
-            later("draw", 40, draw)
+            if not jobs.get("draw"):  # keeps redrawing during a drag, as often as the drawing can keep up
+                jobs["draw"] = self.root.after(16, draw)
             self.state.apply({"style": dict(st)})
             later("save", 400, lambda: self._save(style=dict(st)))
 
@@ -1539,13 +1901,13 @@ class App:
         if kind == "check":
             var = tk.BooleanVar(value=st[key])
             tk.Checkbutton(parent, variable=var, command=lambda: store(var.get()), bg=PANEL, fg=TEXT,
-                           selectcolor="#0e0f12", activebackground=PANEL, activeforeground=TEXT).grid(
+                           selectcolor=FIELD, activebackground=PANEL, activeforeground=TEXT).grid(
                 row=r, column=1, sticky="w", pady=3)
             return var.set
         if kind == "slider":
             var = tk.IntVar(value=st[key])
             tk.Scale(parent, from_=opt[0], to=opt[1], orient="horizontal", variable=var,
-                     command=lambda _: store(var.get()), bg=PANEL, fg=TEXT, troughcolor="#0e0f12",
+                     command=lambda _: store(var.get()), bg=PANEL, fg=TEXT, troughcolor=FIELD,
                      highlightthickness=0, activebackground=ACCENT, sliderrelief="flat", bd=0,
                      font=(FONT, 9), length=300, width=12).grid(row=r, column=1, sticky="w")
             return var.set
@@ -1571,7 +1933,7 @@ class App:
             return put
         # text
         var = tk.StringVar(value=st[key])
-        tk.Entry(parent, textvariable=var, font=(FONT, 11), width=10, bg="#0e0f12", fg=TEXT,
+        tk.Entry(parent, textvariable=var, font=(FONT, 11), width=10, bg=FIELD, fg=TEXT,
                  insertbackground=TEXT, relief="flat").grid(row=r, column=1, sticky="w", pady=3, ipady=3)
         var.trace_add("write", lambda *_: store(var.get()[:20]))
         return var.set
