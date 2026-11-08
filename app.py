@@ -1098,16 +1098,19 @@ class App:
         self.update_check, self.update_status = "checking", None
 
         def work():
+            started = time.perf_counter()
             try:
                 UPDATE_FILE.unlink(missing_ok=True)  # left over from the last update
             except OSError:
                 pass
+            update, result = self.update, "done"
             try:
-                self.update = updater.find_update()
-                self.update_check = "done"
+                update = updater.find_update()
             except Exception as e:  # offline, or GitHub is down
                 print("Update check failed:", e)
-                self.update_check = "error"
+                result = "error"
+            time.sleep(max(0.0, 0.6 - (time.perf_counter() - started)))  # long enough to see "Checking..."
+            self.update, self.update_check = update, result
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1740,6 +1743,16 @@ class App:
         self._switch(p, self._setting_row(p, "Show box when a room is open"),
                      lambda: self.settings.get("visible", True), put_visible)
 
+    @staticmethod
+    def _set_enabled(button, on):
+        """Only touches the button when this is a real change: setting a ttk button's state clears its hover."""
+        want = "normal" if on else "disabled"
+        if str(button.cget("state")) == want:
+            return
+        button.configure(state=want)
+        if on and button.winfo_containing(*button.winfo_pointerxy()) == button:
+            button.state(["active"])  # the mouse was already on it, so no "mouse entered" event will come
+
     def _settings_updates(self, p):
         self.update_dismissed = True  # they've seen it now: no need for the banner on Home as well
         try:
@@ -1748,20 +1761,25 @@ class App:
             version = "Unknown"
         self._setting_text(p, self._setting_row(p, "Installed version"), version)
         status = self._setting_text(p, self._setting_row(p, "Status"))
-        check = ttk.Button(p, text="Check for updates", command=self._check_for_update)
+        def run(action):  # shows the result of the click now, not at the next refresh
+            action()
+            tick()
+
+        check = ttk.Button(p, text="Check for updates", command=lambda: run(self._check_for_update))
         check.grid(row=self._setting_row(p, ""), column=1, sticky="w", pady=(6, 0))
-        now = ttk.Button(p, text="Update now", command=self._start_update, style="Big.TButton")
+        now = ttk.Button(p, text="Update now", command=lambda: run(self._start_update), style="Big.TButton")
         now_row = self._setting_row(p, "")
         now.grid(row=now_row, column=1, sticky="w")
 
         def tick():
             status.configure(text=self._update_text())
-            check.configure(state="disabled" if self.updating or self.update_check == "checking" else "normal")
-            now.configure(state="disabled" if self.updating else "normal")
-            if self.update:
-                now.grid()
-            else:
-                now.grid_remove()
+            self._set_enabled(check, not self.updating and self.update_check != "checking")
+            self._set_enabled(now, not self.updating)
+            if bool(self.update) != bool(now.winfo_manager()):
+                if self.update:
+                    now.grid()
+                else:
+                    now.grid_remove()
 
         tick()
         self.page_tick = tick
