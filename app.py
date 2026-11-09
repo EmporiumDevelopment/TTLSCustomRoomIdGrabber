@@ -955,6 +955,7 @@ class App:
     def _setup_window(self):
         r = self.root
         r.title(APP_NAME)
+        r.iconbitmap(default=str(core.BASE / "app.ico"))  # default= also covers the app's other windows
         r.configure(bg=BG)
         r.geometry(f"{WIDTH}x{HEIGHT}")
         r.resizable(False, False)

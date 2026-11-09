@@ -19,6 +19,7 @@ OutputBaseFilename=RoomIDOverlay-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=app.ico
 UninstallDisplayIcon={app}\RoomIDOverlay.exe
 
 [Tasks]

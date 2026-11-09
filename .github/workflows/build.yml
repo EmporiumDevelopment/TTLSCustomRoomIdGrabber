@@ -49,8 +49,8 @@ jobs:
 
       - name: Build app
         run: >
-          python -m PyInstaller --noconfirm --clean --windowed --name RoomIDOverlay
-          --add-data "overlay.html;." --add-data "control.html;." --add-data "example_room.png;." --add-data "example_roomid.png;."
+          python -m PyInstaller --noconfirm --clean --windowed --name RoomIDOverlay --icon app.ico
+          --add-data "app.ico;." --add-data "overlay.html;." --add-data "control.html;." --add-data "example_room.png;." --add-data "example_roomid.png;."
           --add-data "overlay_url.txt;." --add-data "version.txt;."
           --collect-all rapidocr_onnxruntime --collect-binaries onnxruntime --collect-all windows_capture
           --hidden-import pygrabber.dshow_graph
